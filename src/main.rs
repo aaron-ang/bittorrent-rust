@@ -26,15 +26,12 @@ fn main() -> anyhow::Result<()> {
 
     match args.command {
         Command::Decode { value } => {
-            let decoded_value = decode_bencoded_value(&value)?;
-            println!("{}", decoded_value);
+            decode_bencoded_value(&value)?;
         }
         Command::Info {
             torrent: torrent_path,
         } => {
-            let torrent = parse_torrent_file(torrent_path)?;
-            println!("Tracker URL: {}", torrent.announce);
-            println!("Length: {}", torrent.info.length);
+            parse_torrent_file(torrent_path)?;
         }
     }
 
