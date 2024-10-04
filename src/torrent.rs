@@ -7,6 +7,7 @@ struct Torrent {
     announce: String,
     info: Info,
 }
+
 #[derive(Serialize, Deserialize)]
 struct Info {
     length: i64,
@@ -26,5 +27,10 @@ pub fn parse_torrent_file(file_name: PathBuf) -> anyhow::Result<()> {
         "Info Hash: {}",
         hex::encode(Sha1::digest(serde_bencode::to_bytes(&torrent.info)?))
     );
+    println!("Piece Length: {}", torrent.info.piece_length);
+    println!("Piece Hashes:");
+    for piece in torrent.info.pieces.chunks(20) {
+        println!("{}", hex::encode(piece));
+    }
     Ok(())
 }
