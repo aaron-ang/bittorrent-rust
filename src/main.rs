@@ -4,9 +4,6 @@ use std::path::PathBuf;
 mod decode;
 mod torrent;
 
-use decode::decode_bencoded_value;
-use torrent::parse_torrent_file;
-
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -17,7 +14,8 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
     Decode { value: String },
-    Info { torrent: PathBuf },
+    Info { torrent_path: PathBuf },
+    Peers { torrent_path: PathBuf },
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
@@ -26,12 +24,13 @@ fn main() -> anyhow::Result<()> {
 
     match args.command {
         Command::Decode { value } => {
-            decode_bencoded_value(&value)?;
+            decode::decode_bencoded_value(&value)?;
         }
-        Command::Info {
-            torrent: torrent_path,
-        } => {
-            parse_torrent_file(torrent_path)?;
+        Command::Info { torrent_path } => {
+            torrent::parse_torrent_file(torrent_path)?;
+        }
+        Command::Peers { torrent_path } => {
+            torrent::discover_peers(torrent_path)?;
         }
     }
 
