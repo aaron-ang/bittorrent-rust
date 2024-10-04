@@ -1,7 +1,7 @@
-pub fn decode_bencoded_value(encoded_value: &str) -> anyhow::Result<()> {
+pub fn decode_bencoded_value(encoded_value: &str) -> anyhow::Result<serde_json::Value> {
     let value = serde_bencode::from_str(encoded_value)?;
-    println!("{}", bencode_to_json(value)?);
-    Ok(())
+    let decoded = bencode_to_json(value)?;
+    Ok(decoded)
 }
 
 fn bencode_to_json(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Value> {

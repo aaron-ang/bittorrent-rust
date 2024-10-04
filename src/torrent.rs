@@ -6,10 +6,17 @@ pub struct Torrent {
     pub announce: String,
     pub info: Info,
 }
-
 impl Torrent {
     pub fn info_hash(&self) -> [u8; 20] {
         Sha1::digest(serde_bencode::to_bytes(&self.info).unwrap()).into()
+    }
+
+    pub fn pieces(&self) -> Vec<&[u8]> {
+        self.info
+            .pieces
+            .chunks_exact(20)
+            .map(|chunk| &chunk[..])
+            .collect()
     }
 }
 

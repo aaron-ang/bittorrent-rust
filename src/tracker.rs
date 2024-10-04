@@ -12,13 +12,13 @@ pub struct TrackerRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Tracker {
+pub struct TrackerResponse {
     interval: usize,
     #[serde(with = "serde_bytes")]
     peers: Vec<u8>,
 }
 
-impl Tracker {
+impl TrackerResponse {
     pub fn peers(&self) -> Vec<SocketAddrV4> {
         self.peers
             .chunks_exact(6)
