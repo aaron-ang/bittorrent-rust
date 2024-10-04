@@ -1,51 +1,41 @@
-use serde_json;
-use std::env;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-// Available if you need it!
-use serde_bencode;
+mod decode;
+mod torrent;
 
-#[allow(dead_code)]
-fn decode_bencoded_value(encoded_value: &str) -> anyhow::Result<serde_json::Value> {
-    let value = serde_bencode::from_str(encoded_value)?;
-    bencode_to_json(value)
+use decode::decode_bencoded_value;
+use torrent::parse_torrent_file;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn bencode_to_json(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Value> {
-    match value {
-        serde_bencode::value::Value::Bytes(b) => {
-            Ok(serde_json::Value::String(String::from_utf8(b)?))
-        }
-        serde_bencode::value::Value::Int(i) => {
-            Ok(serde_json::Value::Number(serde_json::Number::from(i)))
-        }
-        serde_bencode::value::Value::List(l) => {
-            let json_list = l
-                .into_iter()
-                .map(|v| bencode_to_json(v))
-                .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
-            Ok(serde_json::Value::Array(json_list))
-        }
-        serde_bencode::value::Value::Dict(d) => {
-            let json_map = d
-                .into_iter()
-                .map(|(k, v)| Ok((String::from_utf8(k)?, bencode_to_json(v)?)))
-                .collect::<anyhow::Result<serde_json::Map<String, serde_json::Value>>>()?;
-            Ok(serde_json::Value::Object(json_map))
-        }
-    }
+#[derive(Subcommand, Debug)]
+enum Command {
+    Decode { value: String },
+    Info { torrent: PathBuf },
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+    let args = Args::parse();
 
-    if command == "decode" {
-        let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value)?;
-        println!("{}", decoded_value.to_string());
-    } else {
-        println!("unknown command: {}", args[1])
+    match args.command {
+        Command::Decode { value } => {
+            let decoded_value = decode_bencoded_value(&value)?;
+            println!("{}", decoded_value);
+        }
+        Command::Info {
+            torrent: torrent_path,
+        } => {
+            let torrent = parse_torrent_file(torrent_path)?;
+            println!("Tracker URL: {}", torrent.announce);
+            println!("Length: {}", torrent.info.length);
+        }
     }
 
     Ok(())
