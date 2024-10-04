@@ -25,8 +25,12 @@ fn bencode_to_json(value: serde_bencode::value::Value) -> anyhow::Result<serde_j
                 .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
             Ok(serde_json::Value::Array(json_list))
         }
-        _ => {
-            panic!("Unhandled encoded value: {:?}", value)
+        serde_bencode::value::Value::Dict(d) => {
+            let json_map = d
+                .into_iter()
+                .map(|(k, v)| Ok((String::from_utf8(k)?, bencode_to_json(v)?)))
+                .collect::<anyhow::Result<serde_json::Map<String, serde_json::Value>>>()?;
+            Ok(serde_json::Value::Object(json_map))
         }
     }
 }
