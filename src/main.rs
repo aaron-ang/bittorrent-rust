@@ -3,6 +3,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::{fs::File, io::AsyncWriteExt};
 
 use bittorrent_starter_rust::decode::decode_bencoded_value;
+use bittorrent_starter_rust::magnet::Magnet;
 use bittorrent_starter_rust::peer::Peer;
 use bittorrent_starter_rust::torrent::Torrent;
 
@@ -39,6 +40,9 @@ enum Command {
         #[arg(short)]
         output: PathBuf,
         torrent: PathBuf,
+    },
+    MagnetParse {
+        link: String,
     },
 }
 
@@ -81,6 +85,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Download { output, torrent } => {
             download(output, torrent).await?;
+        }
+        Command::MagnetParse { link } => {
+            let magnet = Magnet::new(&link)?;
+            println!("Tracker URL: {}", magnet.tracker_url.unwrap());
+            println!("Info Hash: {}", hex::encode(magnet.info_hash));
         }
     }
 

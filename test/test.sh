@@ -9,7 +9,7 @@ output_files=$(find "$current_dir" -name '*.out')
 for torrent in $torrents; do
     echo "Testing $torrent"
     output_file="${torrent%.torrent}.out"
-    ./your_bittorrent.sh download -o "$output_file" "$torrent"
+    $test_script download -o "$output_file" "$torrent"
 done
 
 for file in $output_files; do
