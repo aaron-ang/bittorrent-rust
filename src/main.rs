@@ -1,22 +1,19 @@
 use clap::{Parser, Subcommand};
-use sha1::{Digest, Sha1};
-use std::net::SocketAddrV4;
-use std::path::PathBuf;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use std::{net::SocketAddr, path::PathBuf};
+use tokio::{fs::File, io::AsyncWriteExt};
 
 use bittorrent_starter_rust::decode::decode_bencoded_value;
 use bittorrent_starter_rust::peer::Peer;
 use bittorrent_starter_rust::torrent::Torrent;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 #[clap(rename_all = "snake_case")]
 enum Command {
     Decode {
@@ -38,6 +35,11 @@ enum Command {
         torrent: PathBuf,
         piece: usize,
     },
+    Download {
+        #[arg(short)]
+        output: PathBuf,
+        torrent: PathBuf,
+    },
 }
 
 #[tokio::main(worker_threads = 5)]
@@ -52,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Info { torrent } => {
             let torrent = Torrent::new(torrent)?;
             println!("Tracker URL: {}", torrent.announce);
-            println!("Length: {}", torrent.info.length);
+            println!("Length: {}", torrent.len());
             println!("Info Hash: {}", hex::encode(torrent.info_hash()?));
             println!("Piece Length: {}", torrent.info.piece_length);
             println!("Piece Hashes:");
@@ -77,12 +79,15 @@ async fn main() -> anyhow::Result<()> {
         } => {
             download_piece(output, torrent, piece).await?;
         }
+        Command::Download { output, torrent } => {
+            download(output, torrent).await?;
+        }
     }
 
     Ok(())
 }
 
-async fn discover_peers(file_name: PathBuf) -> anyhow::Result<Vec<SocketAddrV4>> {
+async fn discover_peers(file_name: PathBuf) -> anyhow::Result<Vec<SocketAddr>> {
     let torrent = Torrent::new(file_name)?;
     let peer_addrs = torrent.get_peer_addrs().await?;
     Ok(peer_addrs)
@@ -90,21 +95,37 @@ async fn discover_peers(file_name: PathBuf) -> anyhow::Result<Vec<SocketAddrV4>>
 
 async fn handshake(file_name: PathBuf, peer: String) -> anyhow::Result<Peer> {
     let torrent = Torrent::new(file_name)?;
-    let address = peer.parse::<SocketAddrV4>()?;
+    let address = peer.parse::<SocketAddr>()?;
     let peer = Peer::handshake(address, torrent.info_hash()?).await?;
     Ok(peer)
 }
 
 async fn download_piece(output: PathBuf, file_name: PathBuf, piece: usize) -> anyhow::Result<()> {
     let torrent = Torrent::new(file_name)?;
-    let mut peer = torrent.find_peer_with_piece(piece).await?;
-    println!("Found peer: {:?}", peer.address);
+    let peer_addrs = torrent.get_peer_addrs().await?;
+    let info_hash = torrent.info_hash()?;
+    for peer_address in peer_addrs {
+        match Peer::handshake(peer_address, info_hash).await {
+            Ok(mut peer) => {
+                let pieces = peer.get_pieces().await?;
+                if pieces.contains(&piece) {
+                    peer.prepare_download().await?;
+                    let piece_data = peer.load_piece(torrent, piece as u32).await?;
+                    let mut file = File::create(output).await?;
+                    file.write_all(&piece_data).await?;
+                    return Ok(());
+                }
+            }
+            Err(e) => eprintln!("{} -> {}", peer_address, e),
+        }
+    }
+    Err(anyhow::anyhow!("Could not find peer"))
+}
 
-    let data = peer.load_piece(&torrent, piece as u32).await?;
-    let piece_hash = torrent.pieces()[piece];
-    anyhow::ensure!(*piece_hash == *Sha1::digest(&data));
-
-    let mut file = File::create(output).await.unwrap();
-    file.write_all(&data).await.unwrap();
+async fn download(output: PathBuf, file_name: PathBuf) -> anyhow::Result<()> {
+    let torrent = Torrent::new(file_name)?;
+    let file_bytes = torrent.download().await?;
+    let mut file = File::create(output).await?;
+    file.write_all(&file_bytes).await?;
     Ok(())
 }

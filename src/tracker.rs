@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Serialize)]
 pub struct TrackerRequest {
@@ -19,13 +19,13 @@ pub struct TrackerResponse {
 }
 
 impl TrackerResponse {
-    pub fn peers(&self) -> Vec<SocketAddrV4> {
+    pub fn peers(&self) -> Vec<SocketAddr> {
         self.peers
             .chunks_exact(6)
             .map(|chunk| {
-                let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                let ip = IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]));
                 let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                SocketAddrV4::new(ip, port)
+                SocketAddr::new(ip, port)
             })
             .collect()
     }

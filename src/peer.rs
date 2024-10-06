@@ -1,13 +1,12 @@
 use anyhow::Context;
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{mem, net::SocketAddrV4, sync::Arc, time::Duration};
+use std::{mem, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
     task::JoinSet,
-    time::sleep,
 };
 
 use crate::torrent::Torrent;
@@ -37,13 +36,13 @@ impl Handshake {
 
 #[derive(Clone)]
 pub struct Peer {
-    pub address: SocketAddrV4,
+    pub address: SocketAddr,
     pub id: [u8; 20],
     pub stream: Arc<Mutex<TcpStream>>,
 }
 
 impl Peer {
-    pub async fn handshake(address: SocketAddrV4, info_hash: [u8; 20]) -> anyhow::Result<Self> {
+    pub async fn handshake(address: SocketAddr, info_hash: [u8; 20]) -> anyhow::Result<Self> {
         let mut handshake = Handshake::new(info_hash, *b"00112233445566778899");
         let mut handshake_bytes = bincode::serialize(&handshake)?;
 
@@ -101,68 +100,51 @@ impl Peer {
         Ok(pieces)
     }
 
-    pub async fn load_piece(&mut self, torrent: &Torrent, index: u32) -> anyhow::Result<Vec<u8>> {
+    pub async fn prepare_download(&mut self) -> anyhow::Result<()> {
         let interested = Message::new(MessageTag::INTERESTED, vec![]);
         self.send(interested).await?;
         let msg = self.recv().await?;
         anyhow::ensure!(msg.id == MessageTag::UNCHOKE);
+        Ok(())
+    }
 
+    pub async fn load_piece(&mut self, torrent: Torrent, index: u32) -> anyhow::Result<Vec<u8>> {
         let piece_len = std::cmp::min(
-            torrent.info.piece_length,                               // piece_len
-            torrent.info.length - index * torrent.info.piece_length, // last piece
+            torrent.info.piece_length,                         // piece_len
+            torrent.len() - index * torrent.info.piece_length, // last piece
         );
-
         let mut piece = vec![0u8; piece_len as usize];
         let mut join_set = JoinSet::new();
 
-        for offset in (0..piece_len).step_by(BLOCK_SIZE as usize) {
-            let peer = self.clone();
+        let spawn = |join_set: &mut JoinSet<_>, mut peer: Peer, offset: u32| {
             let length = BLOCK_SIZE.min(piece_len - offset);
-            join_set.spawn(Self::load_block_with_retry(peer, index, offset, length));
+            join_set.spawn(async move {
+                match peer.load_block(index, offset, length).await {
+                    Ok(msg) => (offset, msg.payload[8..].to_vec()),
+                    Err(err) => {
+                        eprintln!("Error loading block: {}. Will retry...", err);
+                        (offset, vec![])
+                    }
+                }
+            });
+        };
+
+        for offset in (0..piece_len).step_by(BLOCK_SIZE as usize) {
+            spawn(&mut join_set, self.clone(), offset);
         }
 
-        while let Some(result) = join_set.join_next().await {
-            let (offset, data) = result
-                .context("Task panicked")?
-                .context("Failed to load block")?;
-
-            let start = offset as usize;
-            let end = start + data.len();
-            piece[start..end].copy_from_slice(&data);
-        }
-
-        Ok(piece)
-    }
-
-    async fn load_block_with_retry(
-        mut peer: Peer,
-        index: u32,
-        offset: u32,
-        length: u32,
-    ) -> anyhow::Result<(u32, Vec<u8>)> {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY: Duration = Duration::from_secs(1);
-
-        for attempt in 1..=MAX_RETRIES {
-            match peer.load_block(index, offset, length).await {
-                Ok(msg) => return Ok((offset, msg.payload[8..].to_vec())),
-                Err(err) if attempt < MAX_RETRIES => {
-                    eprintln!(
-                        "Error loading block (attempt {}/{}): {}. Retrying...",
-                        attempt, MAX_RETRIES, err
-                    );
-                    sleep(RETRY_DELAY).await;
-                }
-                Err(err) => {
-                    return Err(err).context(format!(
-                        "Failed to load block after {} attempts",
-                        MAX_RETRIES
-                    ))
-                }
+        while let Some(join_result) = join_set.join_next().await {
+            let (offset, data) = join_result.context("Task panicked")?;
+            if data.is_empty() {
+                spawn(&mut join_set, self.clone(), offset);
+            } else {
+                let start = offset as usize;
+                let end = start + data.len();
+                piece[start..end].copy_from_slice(&data);
             }
         }
 
-        unreachable!("Loop should always return")
+        Ok(piece)
     }
 
     async fn load_block(&mut self, index: u32, begin: u32, length: u32) -> anyhow::Result<Message> {
@@ -186,7 +168,7 @@ pub struct Message {
     payload: Vec<u8>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(PartialEq, Clone)]
 #[repr(u8)]
 enum MessageTag {
     BITFIELD = 5,

@@ -1,6 +1,13 @@
+use anyhow::Context;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::{net::SocketAddrV4, path::PathBuf};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
+use tokio::{net::UdpSocket, task::JoinSet};
 use url::form_urlencoded;
 
 use crate::{
@@ -8,7 +15,7 @@ use crate::{
     tracker::{TrackerRequest, TrackerResponse},
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Torrent {
     pub announce: String,
     pub info: Info,
@@ -24,51 +31,167 @@ impl Torrent {
         Ok(Sha1::digest(serde_bencode::to_bytes(&self.info)?).into())
     }
 
-    pub fn pieces(&self) -> Vec<&[u8]> {
-        self.info.pieces.chunks_exact(20).collect()
+    pub fn len(&self) -> u32 {
+        match &self.info.additional {
+            Additional::SingleFile { length } => *length,
+            Additional::MultiFile { files } => files.iter().map(|f| f.length).sum(),
+        }
     }
 
-    pub async fn get_peer_addrs(&self) -> anyhow::Result<Vec<SocketAddrV4>> {
+    pub fn pieces(&self) -> Vec<Vec<u8>> {
+        self.info
+            .pieces
+            .chunks_exact(20)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+
+    pub async fn get_peer_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
         let info_hash_str: String = form_urlencoded::byte_serialize(&self.info_hash()?).collect();
         let request = TrackerRequest {
             peer_id: String::from("00112233445566778899"),
             port: 6881,
             uploaded: 0,
             downloaded: 0,
-            left: self.info.length,
+            left: self.len(),
             compact: 1,
         };
-        let params = serde_urlencoded::to_string(&request)?;
-        let url = format!("{}?{}&info_hash={}", self.announce, params, info_hash_str);
-        let response = reqwest::get(url).await?;
-        let tracker_response =
-            serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
-        Ok(tracker_response.peers())
+        let announce = &self.announce;
+        if announce.starts_with("http") {
+            let params = serde_urlencoded::to_string(&request)?;
+            let url = format!("{}?{}&info_hash={}", announce, params, info_hash_str);
+            let response = reqwest::get(url).await?;
+            let tracker_response =
+                serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
+            Ok(tracker_response.peers())
+        } else if announce.starts_with("udp") {
+            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+            let address = Self::parse_udp_url(announce)?;
+            sock.connect(address).await?;
+            Ok(vec![])
+        } else {
+            Err(anyhow::anyhow!("Unsupported tracker protocol"))
+        }
     }
 
-    pub async fn find_peer_with_piece(&self, piece: usize) -> anyhow::Result<Peer> {
+    fn parse_udp_url(url: &str) -> anyhow::Result<String> {
+        let parts: Vec<&str> = url.split(':').collect();
+        let host = parts[1].trim_start_matches('/');
+        let port = parts[2];
+        let addr = format!("{}:{}", host, port);
+        Ok(addr)
+    }
+
+    pub async fn download(&self) -> anyhow::Result<Vec<u8>> {
+        let peer_addrs = self.get_peer_addrs().await?;
+        println!("Found peers: {:?}", peer_addrs);
+
+        let piece_hashes = self.pieces();
+        let num_pieces = piece_hashes.len();
         let info_hash = self.info_hash()?;
-        for peer_address in self.get_peer_addrs().await? {
+        let mut peer_piece_map: HashMap<usize, Vec<Peer>> = HashMap::new();
+        let mut join_set = JoinSet::new();
+
+        for peer_address in peer_addrs {
             match Peer::handshake(peer_address, info_hash).await {
                 Ok(mut peer) => {
                     let pieces = peer.get_pieces().await?;
-                    if pieces.contains(&piece) {
-                        return Ok(peer);
+                    for piece in pieces {
+                        peer_piece_map
+                            .entry(piece)
+                            .or_insert_with(Vec::new)
+                            .push(peer.clone());
                     }
+                    peer.prepare_download().await?;
                 }
                 Err(e) => eprintln!("{} -> {}", peer_address, e),
             }
         }
-        Err(anyhow::anyhow!("Could not find peer"))
+
+        if peer_piece_map.is_empty() {
+            return Err(anyhow::anyhow!("Could not connect to any peers"));
+        }
+
+        let choose_peer = |piece: usize| {
+            let peers = peer_piece_map.get(&piece).unwrap();
+            peers.choose(&mut rand::thread_rng()).unwrap().clone()
+        };
+
+        let spawn = |join_set: &mut JoinSet<_>, piece: usize| {
+            let mut peer = choose_peer(piece);
+            let torrent = self.clone();
+            let piece_hashes = piece_hashes.clone();
+            let piece_number = piece + 1;
+
+            join_set.spawn(async move {
+                match peer.load_piece(torrent, piece as u32).await {
+                    Ok(data) => {
+                        println!(
+                            "Downloaded piece {}/{} from peer {}",
+                            piece_number, num_pieces, peer.address
+                        );
+                        if piece_hashes[piece] != *Sha1::digest(&data) {
+                            eprintln!(
+                                "Piece {}/{} failed verification. Will retry...",
+                                piece_number, num_pieces
+                            );
+                            (piece, vec![])
+                        } else {
+                            (piece, data)
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Error loading piece {}/{}: {}. Will retry...",
+                            piece_number, num_pieces, e
+                        );
+                        (piece, vec![])
+                    }
+                }
+            });
+        };
+
+        for piece in 0..num_pieces {
+            spawn(&mut join_set, piece);
+        }
+
+        let mut file_bytes = vec![0u8; self.len() as usize];
+        let piece_len = self.info.piece_length as usize;
+        while let Some(join_result) = join_set.join_next().await {
+            let (piece, data) = join_result.context("Task panicked")?;
+            if data.is_empty() {
+                spawn(&mut join_set, piece);
+            } else {
+                let start = piece * piece_len;
+                let end = start + data.len();
+                file_bytes[start..end].copy_from_slice(&data);
+            }
+        }
+
+        Ok(file_bytes)
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Info {
-    pub length: u32,
-    name: String,
     #[serde(rename = "piece length")]
     pub piece_length: u32,
     #[serde(with = "serde_bytes")]
     pub pieces: Vec<u8>,
+    name: String,
+    #[serde(flatten)]
+    additional: Additional,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Additional {
+    SingleFile { length: u32 },
+    MultiFile { files: Vec<File> },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct File {
+    length: u32,
+    path: Vec<String>,
 }
