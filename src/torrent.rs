@@ -47,23 +47,28 @@ impl Torrent {
     }
 
     pub async fn find_peer_with_piece(&self, piece: usize) -> anyhow::Result<Peer> {
+        let info_hash = self.info_hash()?;
         for peer_address in self.get_peer_addrs().await? {
-            let mut peer = Peer::handshake(peer_address, self.info_hash()?).await?;
-            let pieces = peer.get_pieces().await?;
-            if pieces.contains(&piece) {
-                return Ok(peer);
+            match Peer::handshake(peer_address, info_hash).await {
+                Ok(mut peer) => {
+                    let pieces = peer.get_pieces().await?;
+                    if pieces.contains(&piece) {
+                        return Ok(peer);
+                    }
+                }
+                Err(e) => eprintln!("{} -> {}", peer_address, e),
             }
         }
-        Err(anyhow::anyhow!("Peer not found"))
+        Err(anyhow::anyhow!("Could not find peer"))
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Info {
-    pub length: usize,
+    pub length: u32,
     name: String,
     #[serde(rename = "piece length")]
-    pub piece_length: usize,
+    pub piece_length: u32,
     #[serde(with = "serde_bytes")]
     pub pieces: Vec<u8>,
 }

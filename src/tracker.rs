@@ -7,7 +7,7 @@ pub struct TrackerRequest {
     pub port: u16,
     pub uploaded: usize,
     pub downloaded: usize,
-    pub left: usize,
+    pub left: u32,
     pub compact: u8,
 }
 

@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use sha1::{Digest, Sha1};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use tokio::fs::File;
@@ -39,8 +40,7 @@ enum Command {
     },
 }
 
-// Usage: your_bittorrent.sh decode "<encoded_value>"
-#[tokio::main]
+#[tokio::main(worker_threads = 5)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Handshake { torrent, peer } => {
             let peer = handshake(torrent, peer).await?;
-            println!("Peer ID: {}", hex::encode(&peer.id.unwrap()));
+            println!("Peer ID: {}", hex::encode(&peer.id));
         }
         Command::DownloadPiece {
             output,
@@ -98,8 +98,13 @@ async fn handshake(file_name: PathBuf, peer: String) -> anyhow::Result<Peer> {
 async fn download_piece(output: PathBuf, file_name: PathBuf, piece: usize) -> anyhow::Result<()> {
     let torrent = Torrent::new(file_name)?;
     let mut peer = torrent.find_peer_with_piece(piece).await?;
-    let piece = peer.load_piece(&torrent, piece).await?;
+    println!("Found peer: {:?}", peer.address);
+
+    let data = peer.load_piece(&torrent, piece as u32).await?;
+    let piece_hash = torrent.pieces()[piece];
+    anyhow::ensure!(*piece_hash == *Sha1::digest(&data));
+
     let mut file = File::create(output).await.unwrap();
-    file.write_all(&piece).await.unwrap();
+    file.write_all(&data).await.unwrap();
     Ok(())
 }
