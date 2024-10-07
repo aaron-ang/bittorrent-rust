@@ -44,6 +44,9 @@ enum Command {
     MagnetParse {
         link: String,
     },
+    MagnetHandshake {
+        link: String,
+    },
 }
 
 #[tokio::main(worker_threads = 5)]
@@ -91,6 +94,12 @@ async fn main() -> anyhow::Result<()> {
             println!("Tracker URL: {}", magnet.tracker_url.unwrap());
             println!("Info Hash: {}", hex::encode(magnet.info_hash));
         }
+        Command::MagnetHandshake { link } => {
+            let magnet = Magnet::new(&link)?;
+            let peer_addrs = magnet.get_peers().await?;
+            let peer = Peer::new(peer_addrs[0], magnet.info_hash).await?;
+            println!("Peer ID: {}", hex::encode(&peer.id));
+        }
     }
 
     Ok(())
@@ -105,7 +114,7 @@ async fn discover_peers(file_name: PathBuf) -> anyhow::Result<Vec<SocketAddr>> {
 async fn handshake(file_name: PathBuf, peer: String) -> anyhow::Result<Peer> {
     let torrent = Torrent::new(file_name)?;
     let address = peer.parse::<SocketAddr>()?;
-    let peer = Peer::handshake(address, torrent.info_hash()?).await?;
+    let peer = Peer::new(address, torrent.info_hash()?).await?;
     Ok(peer)
 }
 
@@ -114,7 +123,7 @@ async fn download_piece(output: PathBuf, file_name: PathBuf, piece: usize) -> an
     let peer_addrs = torrent.get_peer_addrs().await?;
     let info_hash = torrent.info_hash()?;
     for peer_address in peer_addrs {
-        match Peer::handshake(peer_address, info_hash).await {
+        match Peer::new(peer_address, info_hash).await {
             Ok(mut peer) => {
                 let pieces = peer.get_pieces().await?;
                 if pieces.contains(&piece) {

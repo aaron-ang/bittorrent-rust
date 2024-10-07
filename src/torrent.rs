@@ -48,14 +48,7 @@ impl Torrent {
 
     pub async fn get_peer_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
         let info_hash_str: String = form_urlencoded::byte_serialize(&self.info_hash()?).collect();
-        let request = TrackerRequest {
-            peer_id: String::from("00112233445566778899"),
-            port: 6881,
-            uploaded: 0,
-            downloaded: 0,
-            left: self.len(),
-            compact: 1,
-        };
+        let request = TrackerRequest::new(self.len());
         let announce = &self.announce;
         if announce.starts_with("http") {
             let params = serde_urlencoded::to_string(&request)?;
@@ -93,7 +86,7 @@ impl Torrent {
         let mut join_set = JoinSet::new();
 
         for peer_address in peer_addrs {
-            match Peer::handshake(peer_address, info_hash).await {
+            match Peer::new(peer_address, info_hash).await {
                 Ok(mut peer) => {
                     let pieces = peer.get_pieces().await?;
                     for piece in pieces {

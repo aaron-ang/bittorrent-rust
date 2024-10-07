@@ -11,9 +11,22 @@ pub struct TrackerRequest {
     pub compact: u8,
 }
 
+impl TrackerRequest {
+    pub fn new(left: u32) -> Self {
+        Self {
+            peer_id: String::from("00112233445566778899"),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left,
+            compact: 1,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TrackerResponse {
-    interval: usize,
+    interval: Option<u32>,
     #[serde(with = "serde_bytes")]
     peers: Vec<u8>,
 }

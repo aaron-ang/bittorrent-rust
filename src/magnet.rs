@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use url::Url;
+use std::{collections::HashMap, net::SocketAddr};
+use url::{form_urlencoded, Url};
+
+use crate::tracker::{TrackerRequest, TrackerResponse};
 
 const MAGNET_XT_PREFIX: &'static str = "urn:btih:";
 
@@ -34,5 +36,22 @@ impl Magnet {
             tracker_url,
         };
         Ok(magnet)
+    }
+
+    pub async fn get_peers(&self) -> anyhow::Result<Vec<SocketAddr>> {
+        let request = TrackerRequest::new(1);
+        let params = serde_urlencoded::to_string(&request)?;
+        let info_hash_str: String = form_urlencoded::byte_serialize(&self.info_hash).collect();
+        let url = format!(
+            "{}?{}&info_hash={}",
+            self.tracker_url.as_ref().unwrap(),
+            params,
+            info_hash_str,
+        );
+
+        let response = reqwest::get(url).await?;
+        let tracker_response =
+            serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
+        Ok(tracker_response.peers())
     }
 }
