@@ -102,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
             let peer = magnet.handshake().await?;
             println!("Peer ID: {}", hex::encode(&peer.id));
             println!(
-                "Peer Metadata Extension ID: {:?}",
-                peer.metadata_extension_id
+                "Peer Metadata Extension ID: {}",
+                peer.metadata_extension_id.unwrap()
             );
         }
         Command::MagnetInfo { link } => {
