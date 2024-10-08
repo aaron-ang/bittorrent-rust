@@ -10,7 +10,7 @@ use tokio::{
 };
 
 use crate::extension::*;
-use crate::torrent::{Info, Torrent};
+use crate::torrent::Info;
 
 const BLOCK_SIZE: u32 = 16 * 1024; // 16 KiB
 const EXTENSION_SUPPORT_FLAG: u64 = 1 << 20;
@@ -99,7 +99,9 @@ impl Peer {
             total_size: None,
         };
         let mut payload = serde_bencode::to_bytes(&ext_msg)?;
-        let extension_msg_id = self.metadata_extension_id.unwrap();
+        let extension_msg_id = self
+            .metadata_extension_id
+            .expect("metadata extension id should be set during handshake");
         payload.insert(0, extension_msg_id);
 
         let msg = Message::new(MessageId::EXTENSION, payload);
@@ -153,11 +155,7 @@ impl Peer {
         Ok(())
     }
 
-    pub async fn load_piece(&mut self, torrent: Torrent, index: u32) -> anyhow::Result<Vec<u8>> {
-        let piece_len = std::cmp::min(
-            torrent.info.piece_length,                         // piece_len
-            torrent.len() - index * torrent.info.piece_length, // last piece
-        );
+    pub async fn load_piece(&mut self, index: u32, piece_len: u32) -> anyhow::Result<Vec<u8>> {
         let mut piece = vec![0u8; piece_len as usize];
         let mut join_set = JoinSet::new();
 
@@ -208,7 +206,7 @@ impl Peer {
 }
 
 #[derive(Debug)]
-pub struct Message {
+struct Message {
     length: u32,
     id: MessageId,
     payload: Vec<u8>,

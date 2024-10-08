@@ -15,8 +15,7 @@ pub struct Magnet {
 }
 
 impl Magnet {
-    pub fn new(link: &String) -> anyhow::Result<Self> {
-        let url = Url::parse(link)?;
+    pub fn new(url: Url) -> anyhow::Result<Self> {
         if url.scheme() != "magnet" {
             return Err(anyhow::anyhow!("invalid magnet link"));
         }
@@ -41,7 +40,7 @@ impl Magnet {
         Ok(magnet)
     }
 
-    pub async fn get_peers(&self) -> anyhow::Result<Vec<SocketAddr>> {
+    pub async fn get_peer_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
         let request = TrackerRequest::new(1);
         let params = serde_urlencoded::to_string(&request)?;
         let info_hash_str: String = form_urlencoded::byte_serialize(&self.info_hash).collect();
@@ -55,11 +54,13 @@ impl Magnet {
         let response = reqwest::get(url).await?;
         let tracker_response =
             serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
-        Ok(tracker_response.peers())
+        let peer_addrs = tracker_response.peers();
+        println!("Found peers: {:?}", peer_addrs);
+        Ok(peer_addrs)
     }
 
     pub async fn handshake(&self) -> anyhow::Result<Peer> {
-        let peer_addrs = self.get_peers().await?;
+        let peer_addrs = self.get_peer_addrs().await?;
         for peer_address in peer_addrs {
             match Peer::new(peer_address, self.info_hash).await {
                 Ok(mut peer) => {

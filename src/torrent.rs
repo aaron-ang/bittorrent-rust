@@ -88,7 +88,9 @@ impl Torrent {
             let response = reqwest::get(url).await?;
             let tracker_response =
                 serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
-            Ok(tracker_response.peers())
+            let peer_addrs = tracker_response.peers();
+            println!("Found peers: {:?}", peer_addrs);
+            Ok(peer_addrs)
         } else if announce.starts_with("udp") {
             let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
             let address = Self::parse_udp_url(announce)?;
@@ -109,8 +111,6 @@ impl Torrent {
 
     pub async fn download(&self) -> anyhow::Result<Vec<u8>> {
         let peer_addrs = self.get_peer_addrs().await?;
-        println!("Found peers: {:?}", peer_addrs);
-
         let piece_hashes = self.pieces();
         let num_pieces = piece_hashes.len();
         let info_hash = self.info_hash()?;
@@ -147,9 +147,13 @@ impl Torrent {
             let torrent = self.clone();
             let piece_hashes = piece_hashes.clone();
             let piece_number = piece + 1;
+            let piece_len = std::cmp::min(
+                torrent.info.piece_length,
+                torrent.len() - piece as u32 * torrent.info.piece_length,
+            );
 
             join_set.spawn(async move {
-                match peer.load_piece(torrent, piece as u32).await {
+                match peer.load_piece(piece as u32, piece_len).await {
                     Ok(data) => {
                         println!(
                             "Downloaded piece {}/{} from peer {}",
