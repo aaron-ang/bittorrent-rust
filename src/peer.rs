@@ -24,7 +24,7 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+    pub fn new(info_hash: [u8; 20]) -> Self {
         let mut reserved = 0;
         reserved |= EXTENSION_SUPPORT_FLAG;
         Self {
@@ -32,8 +32,12 @@ impl Handshake {
             protocol: *b"BitTorrent protocol",
             reserved: reserved.to_be_bytes(),
             info_hash,
-            peer_id,
+            peer_id: *b"00112233445566778899",
         }
+    }
+
+    pub fn supports_extension(&self) -> bool {
+        self.reserved[5] & 0x10 != 0
     }
 }
 
@@ -42,11 +46,12 @@ pub struct Peer {
     pub address: SocketAddr,
     pub id: [u8; 20],
     pub stream: Arc<Mutex<TcpStream>>,
+    pub supports_extension: bool,
 }
 
 impl Peer {
     pub async fn new(address: SocketAddr, info_hash: [u8; 20]) -> anyhow::Result<Self> {
-        let mut handshake = Handshake::new(info_hash, *b"00112233445566778899");
+        let mut handshake = Handshake::new(info_hash);
         let mut handshake_bytes = bincode::serialize(&handshake)?;
 
         let mut peer_stream = TcpStream::connect(address)
@@ -66,8 +71,19 @@ impl Peer {
             address,
             id: handshake.peer_id,
             stream: Arc::new(Mutex::new(peer_stream)),
+            supports_extension: handshake.supports_extension(),
         };
         Ok(peer)
+    }
+
+    pub async fn extension_handshake(&mut self) -> anyhow::Result<()> {
+        let extension = Extension::new();
+        let mut payload = bincode::serialize(&extension)?;
+        payload.insert(0, 0); // message ID
+        let msg = Message::new(MessageId::EXTENSION, payload);
+        self.send(msg).await?;
+        self.recv().await?;
+        Ok(())
     }
 
     async fn recv(&mut self) -> anyhow::Result<Message> {
@@ -78,9 +94,9 @@ impl Peer {
 
         let mut buf = [0u8; 1];
         stream.read_exact(&mut buf).await?;
-        let id: MessageTag = unsafe { mem::transmute(buf[0]) };
+        let id: MessageId = unsafe { mem::transmute(buf[0]) };
 
-        let mut buf = vec![0u8; length as usize - mem::size_of::<MessageTag>()];
+        let mut buf = vec![0u8; length as usize - mem::size_of::<MessageId>()];
         stream.read_exact(&mut buf).await?;
         Ok(Message {
             length,
@@ -97,17 +113,17 @@ impl Peer {
 
     pub async fn get_pieces(&mut self) -> anyhow::Result<Vec<usize>> {
         let msg = self.recv().await?;
-        anyhow::ensure!(msg.id == MessageTag::BITFIELD);
+        anyhow::ensure!(msg.id == MessageId::BITFIELD);
         let bitfield = BitVec::<u8, Msb0>::from_vec(msg.payload);
         let pieces = bitfield.iter_ones().collect();
         Ok(pieces)
     }
 
     pub async fn prepare_download(&mut self) -> anyhow::Result<()> {
-        let interested = Message::new(MessageTag::INTERESTED, vec![]);
+        let interested = Message::new(MessageId::INTERESTED, vec![]);
         self.send(interested).await?;
         let msg = self.recv().await?;
-        anyhow::ensure!(msg.id == MessageTag::UNCHOKE);
+        anyhow::ensure!(msg.id == MessageId::UNCHOKE);
         Ok(())
     }
 
@@ -157,33 +173,34 @@ impl Peer {
             length.to_be_bytes(),
         ]
         .concat();
-        let request = Message::new(MessageTag::REQUEST, payload);
+        let request = Message::new(MessageId::REQUEST, payload);
         self.send(request).await?;
         let msg = self.recv().await?;
-        anyhow::ensure!(msg.id == MessageTag::PIECE);
+        anyhow::ensure!(msg.id == MessageId::PIECE);
         Ok(msg)
     }
 }
 
 pub struct Message {
     length: u32,
-    id: MessageTag,
+    id: MessageId,
     payload: Vec<u8>,
 }
 
 #[derive(PartialEq, Clone)]
 #[repr(u8)]
-enum MessageTag {
+enum MessageId {
     BITFIELD = 5,
     INTERESTED = 2,
     UNCHOKE = 1,
     REQUEST = 6,
     PIECE = 7,
+    EXTENSION = 20,
 }
 
 impl Message {
-    fn new(id: MessageTag, payload: Vec<u8>) -> Self {
-        let length = (mem::size_of::<MessageTag>() + payload.len()) as u32;
+    fn new(id: MessageId, payload: Vec<u8>) -> Self {
+        let length = (mem::size_of::<MessageId>() + payload.len()) as u32;
         Self {
             length,
             id,
@@ -197,5 +214,34 @@ impl Message {
         bytes.push(self.id.clone() as u8);
         bytes.extend(self.payload.as_slice());
         bytes
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Extension {
+    m: ExtensionMetadata,
+    p: u16, // port
+    metadata_size: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExtensionMetadata {
+    ut_metadata: u8,
+    ut_pex: u8,
+}
+
+impl Extension {
+    fn new() -> Self {
+        let metadata = ExtensionMetadata {
+            ut_metadata: 1,
+            ut_pex: 2,
+        };
+        let port = 6881;
+        let size = (mem::size_of::<ExtensionMetadata>() + mem::size_of_val(&port)) as u32;
+        Self {
+            m: metadata,
+            p: port,
+            metadata_size: size,
+        }
     }
 }

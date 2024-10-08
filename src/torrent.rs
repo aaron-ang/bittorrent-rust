@@ -21,6 +21,30 @@ pub struct Torrent {
     pub info: Info,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Info {
+    #[serde(rename = "piece length")]
+    pub piece_length: u32,
+    #[serde(with = "serde_bytes")]
+    pub pieces: Vec<u8>,
+    name: String,
+    #[serde(flatten)]
+    additional: Additional,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Additional {
+    SingleFile { length: u32 },
+    MultiFile { files: Vec<File> },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct File {
+    length: u32,
+    path: Vec<String>,
+}
+
 impl Torrent {
     pub fn new(file_name: PathBuf) -> anyhow::Result<Self> {
         let content = std::fs::read(file_name)?;
@@ -163,28 +187,4 @@ impl Torrent {
 
         Ok(file_bytes)
     }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Info {
-    #[serde(rename = "piece length")]
-    pub piece_length: u32,
-    #[serde(with = "serde_bytes")]
-    pub pieces: Vec<u8>,
-    name: String,
-    #[serde(flatten)]
-    additional: Additional,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum Additional {
-    SingleFile { length: u32 },
-    MultiFile { files: Vec<File> },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct File {
-    length: u32,
-    path: Vec<String>,
 }

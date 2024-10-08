@@ -95,9 +95,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Info Hash: {}", hex::encode(magnet.info_hash));
         }
         Command::MagnetHandshake { link } => {
-            let magnet = Magnet::new(&link)?;
-            let peer_addrs = magnet.get_peers().await?;
-            let peer = Peer::new(peer_addrs[0], magnet.info_hash).await?;
+            let peer = magnet_handshake(link).await?;
             println!("Peer ID: {}", hex::encode(&peer.id));
         }
     }
@@ -146,4 +144,21 @@ async fn download(output: PathBuf, file_name: PathBuf) -> anyhow::Result<()> {
     let mut file = File::create(output).await?;
     file.write_all(&file_bytes).await?;
     Ok(())
+}
+
+async fn magnet_handshake(link: String) -> anyhow::Result<Peer> {
+    let magnet = Magnet::new(&link)?;
+    let peer_addrs = magnet.get_peers().await?;
+    for peer_address in peer_addrs {
+        match Peer::new(peer_address, magnet.info_hash).await {
+            Ok(mut peer) => {
+                if peer.supports_extension {
+                    peer.extension_handshake().await?;
+                }
+                return Ok(peer);
+            }
+            Err(e) => eprintln!("{} -> {}", peer_address, e),
+        }
+    }
+    Err(anyhow::anyhow!("Could not find peer"))
 }
