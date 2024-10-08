@@ -9,7 +9,8 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::torrent::Torrent;
+use crate::extension::*;
+use crate::torrent::{Info, Torrent};
 
 const BLOCK_SIZE: u32 = 16 * 1024; // 16 KiB
 const EXTENSION_SUPPORT_FLAG: u64 = 1 << 20;
@@ -47,6 +48,7 @@ pub struct Peer {
     pub id: [u8; 20],
     pub stream: Arc<Mutex<TcpStream>>,
     pub supports_extension: bool,
+    pub metadata_extension_id: Option<u8>,
 }
 
 impl Peer {
@@ -72,18 +74,42 @@ impl Peer {
             id: handshake.peer_id,
             stream: Arc::new(Mutex::new(peer_stream)),
             supports_extension: handshake.supports_extension(),
+            metadata_extension_id: None,
         };
         Ok(peer)
     }
 
     pub async fn extension_handshake(&mut self) -> anyhow::Result<()> {
-        let extension = Extension::new();
-        let mut payload = bincode::serialize(&extension)?;
-        payload.insert(0, 0); // message ID
+        let ext_header = ExtensionHeader::new();
+        let mut payload = serde_bencode::to_bytes(&ext_header)?;
+        payload.insert(0, 0);
+
+        let handshake = Message::new(MessageId::EXTENSION, payload);
+        self.send(handshake).await?;
+        let reply = self.recv().await?;
+        let ext_header = serde_bencode::from_bytes::<ExtensionHeader>(&reply.payload[1..])?;
+        self.metadata_extension_id = Some(ext_header.m.ut_metadata);
+        Ok(())
+    }
+
+    pub async fn extension_metadata(&mut self) -> anyhow::Result<Info> {
+        let ext_msg = ExtensionMessage {
+            msg_type: ExtensionMessageType::Request,
+            piece: 0,
+            total_size: None,
+        };
+        let mut payload = serde_bencode::to_bytes(&ext_msg)?;
+        let extension_msg_id = self.metadata_extension_id.unwrap();
+        payload.insert(0, extension_msg_id);
+
         let msg = Message::new(MessageId::EXTENSION, payload);
         self.send(msg).await?;
-        self.recv().await?;
-        Ok(())
+        let reply = self.recv().await?;
+        let ext_msg = serde_bencode::from_bytes::<ExtensionMessage>(&reply.payload[1..])?;
+        let metadata_piece_len = ext_msg.total_size.unwrap();
+        let metadata = &reply.payload[reply.payload.len() - metadata_piece_len as usize..];
+        let torrent_info = serde_bencode::from_bytes::<Info>(metadata)?;
+        Ok(torrent_info)
     }
 
     async fn recv(&mut self) -> anyhow::Result<Message> {
@@ -181,13 +207,14 @@ impl Peer {
     }
 }
 
+#[derive(Debug)]
 pub struct Message {
     length: u32,
     id: MessageId,
     payload: Vec<u8>,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(u8)]
 enum MessageId {
     BITFIELD = 5,
@@ -211,37 +238,8 @@ impl Message {
     fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(self.length.to_be_bytes());
-        bytes.push(self.id.clone() as u8);
+        bytes.push(self.id as u8);
         bytes.extend(self.payload.as_slice());
         bytes
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Extension {
-    m: ExtensionMetadata,
-    p: u16, // port
-    metadata_size: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ExtensionMetadata {
-    ut_metadata: u8,
-    ut_pex: u8,
-}
-
-impl Extension {
-    fn new() -> Self {
-        let metadata = ExtensionMetadata {
-            ut_metadata: 1,
-            ut_pex: 2,
-        };
-        let port = 6881;
-        let size = (mem::size_of::<ExtensionMetadata>() + mem::size_of_val(&port)) as u32;
-        Self {
-            m: metadata,
-            p: port,
-            metadata_size: size,
-        }
     }
 }

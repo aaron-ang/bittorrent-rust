@@ -11,6 +11,7 @@ use tokio::{net::UdpSocket, task::JoinSet};
 use url::form_urlencoded;
 
 use crate::{
+    magnet::Magnet,
     peer::Peer,
     tracker::{TrackerRequest, TrackerResponse},
 };
@@ -49,6 +50,13 @@ impl Torrent {
     pub fn new(file_name: PathBuf) -> anyhow::Result<Self> {
         let content = std::fs::read(file_name)?;
         Ok(serde_bencode::from_bytes::<Self>(&content)?)
+    }
+
+    pub fn from_magnet_and_metadata(magnet: Magnet, metadata: Info) -> anyhow::Result<Self> {
+        Ok(Self {
+            announce: magnet.tracker_url.unwrap().to_string(),
+            info: metadata,
+        })
     }
 
     pub fn info_hash(&self) -> anyhow::Result<[u8; 20]> {

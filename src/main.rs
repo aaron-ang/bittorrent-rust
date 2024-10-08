@@ -47,6 +47,9 @@ enum Command {
     MagnetHandshake {
         link: String,
     },
+    MagnetInfo {
+        link: String,
+    },
 }
 
 #[tokio::main(worker_threads = 5)]
@@ -95,8 +98,27 @@ async fn main() -> anyhow::Result<()> {
             println!("Info Hash: {}", hex::encode(magnet.info_hash));
         }
         Command::MagnetHandshake { link } => {
-            let peer = magnet_handshake(link).await?;
+            let magnet = Magnet::new(&link)?;
+            let peer = magnet.handshake().await?;
             println!("Peer ID: {}", hex::encode(&peer.id));
+            println!(
+                "Peer Metadata Extension ID: {:?}",
+                peer.metadata_extension_id
+            );
+        }
+        Command::MagnetInfo { link } => {
+            let magnet = Magnet::new(&link)?;
+            let mut peer = magnet.handshake().await?;
+            let metadata = peer.extension_metadata().await?;
+            let torrent = Torrent::from_magnet_and_metadata(magnet, metadata)?;
+            println!("Tracker URL: {}", torrent.announce);
+            println!("Length: {}", torrent.len());
+            println!("Info Hash: {}", hex::encode(torrent.info_hash()?));
+            println!("Piece Length: {}", torrent.info.piece_length);
+            println!("Piece Hashes:");
+            for piece_hash in torrent.pieces() {
+                println!("{}", hex::encode(piece_hash));
+            }
         }
     }
 
@@ -144,21 +166,4 @@ async fn download(output: PathBuf, file_name: PathBuf) -> anyhow::Result<()> {
     let mut file = File::create(output).await?;
     file.write_all(&file_bytes).await?;
     Ok(())
-}
-
-async fn magnet_handshake(link: String) -> anyhow::Result<Peer> {
-    let magnet = Magnet::new(&link)?;
-    let peer_addrs = magnet.get_peers().await?;
-    for peer_address in peer_addrs {
-        match Peer::new(peer_address, magnet.info_hash).await {
-            Ok(mut peer) => {
-                if peer.supports_extension {
-                    peer.extension_handshake().await?;
-                }
-                return Ok(peer);
-            }
-            Err(e) => eprintln!("{} -> {}", peer_address, e),
-        }
-    }
-    Err(anyhow::anyhow!("Could not find peer"))
 }

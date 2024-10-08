@@ -1,7 +1,10 @@
 use std::{collections::HashMap, net::SocketAddr};
 use url::{form_urlencoded, Url};
 
-use crate::tracker::{TrackerRequest, TrackerResponse};
+use crate::{
+    peer::Peer,
+    tracker::{TrackerRequest, TrackerResponse},
+};
 
 const MAGNET_XT_PREFIX: &'static str = "urn:btih:";
 
@@ -53,5 +56,22 @@ impl Magnet {
         let tracker_response =
             serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
         Ok(tracker_response.peers())
+    }
+
+    pub async fn handshake(&self) -> anyhow::Result<Peer> {
+        let peer_addrs = self.get_peers().await?;
+        for peer_address in peer_addrs {
+            match Peer::new(peer_address, self.info_hash).await {
+                Ok(mut peer) => {
+                    if peer.supports_extension {
+                        peer.get_pieces().await?;
+                        peer.extension_handshake().await?;
+                    }
+                    return Ok(peer);
+                }
+                Err(e) => eprintln!("{} -> {}", peer_address, e),
+            }
+        }
+        Err(anyhow::anyhow!("Could not find peer"))
     }
 }
