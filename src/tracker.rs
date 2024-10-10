@@ -1,6 +1,7 @@
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use crate::peer::Peer;
 
 #[derive(Debug, Serialize)]
 pub struct TrackerRequest {
@@ -14,10 +15,7 @@ pub struct TrackerRequest {
 
 impl TrackerRequest {
     pub fn new(left: u32) -> Self {
-        // randomize peer_id
-        let peer_id = (0..20)
-            .map(|_| rand::thread_rng().gen_range(0..10).to_string())
-            .collect::<String>();
+        let peer_id = Peer::gen_peer_id();
         Self {
             peer_id,
             port: 6881,

@@ -1,5 +1,6 @@
 use anyhow::Context;
 use bitvec::prelude::*;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{mem, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -28,12 +29,13 @@ impl Handshake {
     pub fn new(info_hash: [u8; 20]) -> Self {
         let mut reserved = 0;
         reserved |= EXTENSION_SUPPORT_FLAG;
+        let peer_id: [u8; 20] = Peer::gen_peer_id().as_bytes().try_into().unwrap();
         Self {
             length: 19,
             protocol: *b"BitTorrent protocol",
             reserved: reserved.to_be_bytes(),
             info_hash,
-            peer_id: *b"00112233445566778899",
+            peer_id,
         }
     }
 
@@ -202,6 +204,13 @@ impl Peer {
         let msg = self.recv().await?;
         anyhow::ensure!(msg.id == MessageId::PIECE);
         Ok(msg)
+    }
+
+    pub fn gen_peer_id() -> String {
+        let peer_id_len = 20;
+        (0..peer_id_len)
+            .map(|_| rand::thread_rng().gen_range(0..10).to_string())
+            .collect()
     }
 }
 
