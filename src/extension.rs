@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::mem;
 
 #[derive(Serialize, Deserialize)]
@@ -39,7 +40,8 @@ pub struct ExtensionMessage {
     pub total_size: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum ExtensionMessageType {
     Request,
     Data,
