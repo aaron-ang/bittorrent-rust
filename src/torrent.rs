@@ -217,6 +217,7 @@ impl Torrent {
         while let Some(join_result) = join_set.join_next().await {
             let (piece, data) = join_result.context("Task panicked")?;
             if data.is_empty() {
+                println!("Retrying piece {}/{}", piece + 1, num_pieces);
                 spawn(&mut join_set, piece);
             } else {
                 let start = piece * piece_len as usize;

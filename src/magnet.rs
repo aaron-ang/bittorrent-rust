@@ -81,6 +81,32 @@ impl Magnet {
         Err(anyhow::anyhow!("Could not find peer"))
     }
 
+    pub async fn download_piece(&self, piece: usize) -> anyhow::Result<Vec<u8>> {
+        let peer_addrs = self.get_peer_addrs().await?;
+        // Establish TCP connection with a peer and perform base handshake
+        for peer_address in peer_addrs {
+            match Peer::new(peer_address, self.info_hash).await {
+                Ok(mut peer) => {
+                    let pieces = peer.get_pieces().await?;
+                    if pieces.contains(&piece) && peer.supports_extension {
+                        peer.extension_handshake().await?;
+                        let metadata = peer.extension_metadata().await?;
+                        let piece = piece as u32;
+                        let piece_len = std::cmp::min(
+                            metadata.piece_length,                               // piece_len
+                            metadata.file_len() - piece * metadata.piece_length, // last piece
+                        );
+                        peer.prepare_download().await?;
+                        let piece_data = peer.load_piece(piece, piece_len).await?;
+                        return Ok(piece_data);
+                    }
+                }
+                Err(e) => eprintln!("{} -> {}", peer_address, e),
+            }
+        }
+        Err(anyhow::anyhow!("Could not find peer"))
+    }
+
     pub async fn download(&self) -> anyhow::Result<Vec<u8>> {
         let peer_addrs = self.get_peer_addrs().await?;
         let mut metadata: Option<Info> = None;
@@ -166,6 +192,7 @@ impl Magnet {
         while let Some(join_result) = join_set.join_next().await {
             let (piece, data) = join_result.context("Task panicked")?;
             if data.is_empty() {
+                println!("Retrying piece {}/{}", piece + 1, num_pieces);
                 spawn(&mut join_set, piece);
             } else {
                 let start = piece * piece_len as usize;
