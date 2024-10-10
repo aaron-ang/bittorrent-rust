@@ -101,7 +101,12 @@ async fn main() -> anyhow::Result<()> {
             output,
             torrent,
             piece,
-        } => download_piece(output, torrent, piece).await?,
+        } => {
+            let torrent = Torrent::new(torrent)?;
+            let piece_bytes = torrent.download_piece(piece).await?;
+            let mut file = File::create(output).await?;
+            file.write_all(&piece_bytes).await?;
+        }
         Command::Download { output, torrent } => {
             let torrent = Torrent::new(torrent)?;
             let file_bytes = torrent.download().await?;
@@ -141,7 +146,15 @@ async fn main() -> anyhow::Result<()> {
             magnet_link,
             piece,
         } => magnet_download_piece(output, magnet_link, piece).await?,
-        _ => todo!(),
+        Command::MagnetDownload {
+            output,
+            magnet_link,
+        } => {
+            let magnet = Magnet::new(magnet_link)?;
+            let file_bytes = magnet.download().await?;
+            let mut file = File::create(output).await?;
+            file.write_all(&file_bytes).await?;
+        }
     }
 
     Ok(())
@@ -159,33 +172,6 @@ async fn handshake(file_name: PathBuf, peer_address: SocketAddr) -> anyhow::Resu
     Ok(peer)
 }
 
-async fn download_piece(output: PathBuf, file_name: PathBuf, piece: usize) -> anyhow::Result<()> {
-    let torrent = Torrent::new(file_name)?;
-    let peer_addrs = torrent.get_peer_addrs().await?;
-    let info_hash = torrent.info_hash()?;
-    for peer_address in peer_addrs {
-        match Peer::new(peer_address, info_hash).await {
-            Ok(mut peer) => {
-                let pieces = peer.get_pieces().await?;
-                if pieces.contains(&piece) {
-                    let piece = piece as u32;
-                    let piece_len = std::cmp::min(
-                        torrent.info.piece_length,                         // piece_len
-                        torrent.len() - piece * torrent.info.piece_length, // last piece
-                    );
-                    peer.prepare_download().await?;
-                    let piece_data = peer.load_piece(piece, piece_len).await?;
-                    let mut file = File::create(output).await?;
-                    file.write_all(&piece_data).await?;
-                    return Ok(());
-                }
-            }
-            Err(e) => eprintln!("{} -> {}", peer_address, e),
-        }
-    }
-    Err(anyhow::anyhow!("Could not find peer"))
-}
-
 async fn magnet_download_piece(
     output: PathBuf,
     magnet_link: Url,
@@ -193,6 +179,7 @@ async fn magnet_download_piece(
 ) -> anyhow::Result<()> {
     let magnet = Magnet::new(magnet_link)?;
     let peer_addrs = magnet.get_peer_addrs().await?;
+    // Establish TCP connection with a peer and perform base handshake
     for peer_address in peer_addrs {
         match Peer::new(peer_address, magnet.info_hash).await {
             Ok(mut peer) => {
@@ -200,11 +187,10 @@ async fn magnet_download_piece(
                 if pieces.contains(&piece) && peer.supports_extension {
                     peer.extension_handshake().await?;
                     let metadata = peer.extension_metadata().await?;
-                    let torrent = Torrent::from_magnet_and_metadata(magnet, metadata)?;
                     let piece = piece as u32;
                     let piece_len = std::cmp::min(
-                        torrent.info.piece_length,                         // piece_len
-                        torrent.len() - piece * torrent.info.piece_length, // last piece
+                        metadata.piece_length,                               // piece_len
+                        metadata.file_len() - piece * metadata.piece_length, // last piece
                     );
                     peer.prepare_download().await?;
                     let piece_data = peer.load_piece(piece, piece_len).await?;

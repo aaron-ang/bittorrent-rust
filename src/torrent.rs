@@ -40,6 +40,19 @@ enum Additional {
     MultiFile { files: Vec<File> },
 }
 
+impl Info {
+    pub fn pieces(&self) -> Vec<Vec<u8>> {
+        self.pieces.chunks(20).map(|c| c.to_vec()).collect()
+    }
+
+    pub fn file_len(&self) -> u32 {
+        match &self.additional {
+            Additional::SingleFile { length } => *length,
+            Additional::MultiFile { files } => files.iter().map(|f| f.length).sum(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct File {
     length: u32,
@@ -64,18 +77,11 @@ impl Torrent {
     }
 
     pub fn len(&self) -> u32 {
-        match &self.info.additional {
-            Additional::SingleFile { length } => *length,
-            Additional::MultiFile { files } => files.iter().map(|f| f.length).sum(),
-        }
+        self.info.file_len()
     }
 
     pub fn pieces(&self) -> Vec<Vec<u8>> {
-        self.info
-            .pieces
-            .chunks_exact(20)
-            .map(|chunk| chunk.to_vec())
-            .collect()
+        self.info.pieces()
     }
 
     pub async fn get_peer_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
@@ -109,11 +115,38 @@ impl Torrent {
         Ok(addr)
     }
 
+    pub async fn download_piece(&self, piece: usize) -> anyhow::Result<Vec<u8>> {
+        let peer_addrs = self.get_peer_addrs().await?;
+        let info_hash = self.info_hash()?;
+        for peer_address in peer_addrs {
+            match Peer::new(peer_address, info_hash).await {
+                Ok(mut peer) => {
+                    let pieces = peer.get_pieces().await?;
+                    if pieces.contains(&piece) {
+                        let piece = piece as u32;
+                        let piece_len = std::cmp::min(
+                            self.info.piece_length,                      // piece_len
+                            self.len() - piece * self.info.piece_length, // last piece
+                        );
+                        peer.prepare_download().await?;
+                        let piece_data = peer.load_piece(piece, piece_len).await?;
+                        return Ok(piece_data);
+                    }
+                }
+                Err(e) => eprintln!("{} -> {}", peer_address, e),
+            }
+        }
+        Err(anyhow::anyhow!("Could not find peer"))
+    }
+
     pub async fn download(&self) -> anyhow::Result<Vec<u8>> {
         let peer_addrs = self.get_peer_addrs().await?;
         let piece_hashes = self.pieces();
         let num_pieces = piece_hashes.len();
         let info_hash = self.info_hash()?;
+        let piece_len = self.info.piece_length;
+        let file_len = self.len();
+
         let mut peer_piece_map: HashMap<usize, Vec<Peer>> = HashMap::new();
         let mut join_set = JoinSet::new();
 
@@ -144,13 +177,9 @@ impl Torrent {
 
         let spawn = |join_set: &mut JoinSet<_>, piece: usize| {
             let mut peer = choose_peer(piece);
-            let torrent = self.clone();
             let piece_hashes = piece_hashes.clone();
             let piece_number = piece + 1;
-            let piece_len = std::cmp::min(
-                torrent.info.piece_length,
-                torrent.len() - piece as u32 * torrent.info.piece_length,
-            );
+            let piece_len = std::cmp::min(piece_len, file_len - piece as u32 * piece_len);
 
             join_set.spawn(async move {
                 match peer.load_piece(piece as u32, piece_len).await {
@@ -184,14 +213,13 @@ impl Torrent {
             spawn(&mut join_set, piece);
         }
 
-        let mut file_bytes = vec![0u8; self.len() as usize];
-        let piece_len = self.info.piece_length as usize;
+        let mut file_bytes = vec![0u8; file_len as usize];
         while let Some(join_result) = join_set.join_next().await {
             let (piece, data) = join_result.context("Task panicked")?;
             if data.is_empty() {
                 spawn(&mut join_set, piece);
             } else {
-                let start = piece * piece_len;
+                let start = piece * piece_len as usize;
                 let end = start + data.len();
                 file_bytes[start..end].copy_from_slice(&data);
             }
