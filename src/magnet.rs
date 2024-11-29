@@ -22,13 +22,13 @@ pub struct Magnet {
 impl Magnet {
     pub fn new(url: Url) -> anyhow::Result<Self> {
         if url.scheme() != "magnet" {
-            return Err(anyhow::anyhow!("invalid magnet link"));
+            anyhow::bail!("invalid magnet link");
         }
 
         let query_pairs = url.query_pairs().collect::<HashMap<_, _>>();
         let xt = query_pairs.get("xt").ok_or(anyhow::anyhow!("missing xt"))?;
         if !xt.starts_with(MAGNET_XT_PREFIX) {
-            return Err(anyhow::anyhow!("invalid xt"));
+            anyhow::bail!("invalid xt");
         }
 
         let info_hash = hex::decode(&xt[MAGNET_XT_PREFIX.len()..])?
@@ -78,7 +78,7 @@ impl Magnet {
                 Err(e) => eprintln!("{} -> {}", peer_address, e),
             }
         }
-        Err(anyhow::anyhow!("Could not find peer"))
+        anyhow::bail!("Could not find peer")
     }
 
     pub async fn download_piece(&self, piece: usize) -> anyhow::Result<Vec<u8>> {
@@ -104,7 +104,7 @@ impl Magnet {
                 Err(e) => eprintln!("{} -> {}", peer_address, e),
             }
         }
-        Err(anyhow::anyhow!("Could not find peer"))
+        anyhow::bail!("Could not find peer")
     }
 
     pub async fn download(&self) -> anyhow::Result<Vec<u8>> {
@@ -136,7 +136,7 @@ impl Magnet {
         }
 
         if peer_piece_map.is_empty() || metadata.is_none() {
-            return Err(anyhow::anyhow!("Could not connect to any peers"));
+            anyhow::bail!("Could not connect to any peers");
         }
 
         let metadata = metadata.unwrap();
@@ -151,7 +151,7 @@ impl Magnet {
         };
 
         let spawn = |join_set: &mut JoinSet<_>, piece: usize| {
-            let mut peer = choose_peer(piece);
+            let peer = choose_peer(piece);
             let piece_hashes = piece_hashes.clone();
             let piece_number = piece + 1;
             let piece_len = std::cmp::min(piece_len, file_len - piece as u32 * piece_len);
@@ -159,10 +159,6 @@ impl Magnet {
             join_set.spawn(async move {
                 match peer.load_piece(piece as u32, piece_len).await {
                     Ok(data) => {
-                        println!(
-                            "Downloaded piece {}/{} from peer {}",
-                            piece_number, num_pieces, peer.address
-                        );
                         if piece_hashes[piece] != *Sha1::digest(&data) {
                             eprintln!(
                                 "Piece {}/{} failed verification. Will retry...",
@@ -170,6 +166,10 @@ impl Magnet {
                             );
                             (piece, vec![])
                         } else {
+                            println!(
+                                "Successfully downloaded piece {}/{} from peer {}",
+                                piece_number, num_pieces, peer.address
+                            );
                             (piece, data)
                         }
                     }

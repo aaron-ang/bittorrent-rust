@@ -1,28 +1,31 @@
-use anyhow::Context;
+use anyhow::{anyhow, bail, Context, Result};
 use bitvec::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::{mem, net::SocketAddr, sync::Arc};
+use std::{convert::TryInto, mem, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
     task::JoinSet,
+    time::{sleep, Duration},
 };
 
-use crate::extension::*;
-use crate::torrent::Info;
+use crate::{extension::*, torrent::Info};
 
-const BLOCK_SIZE: u32 = 16 * 1024; // 16 KiB
+const PROTOCOL: &str = "BitTorrent protocol";
+const PROTOCOL_LEN: usize = PROTOCOL.len();
+const PEER_ID_LEN: usize = 20;
 const EXTENSION_SUPPORT_FLAG: u64 = 1 << 20;
+const BLOCK_SIZE: u32 = 16 * 1024; // 16 KiB
 
 #[derive(Serialize, Deserialize)]
 pub struct Handshake {
     pub length: u8,
-    pub protocol: [u8; 19],
+    pub protocol: [u8; PROTOCOL_LEN],
     pub reserved: [u8; 8],
     pub info_hash: [u8; 20],
-    pub peer_id: [u8; 20],
+    pub peer_id: [u8; PEER_ID_LEN],
 }
 
 impl Handshake {
@@ -31,8 +34,8 @@ impl Handshake {
         reserved |= EXTENSION_SUPPORT_FLAG;
         let peer_id: [u8; 20] = Peer::gen_peer_id().as_bytes().try_into().unwrap();
         Self {
-            length: 19,
-            protocol: *b"BitTorrent protocol",
+            length: PROTOCOL_LEN as u8,
+            protocol: PROTOCOL.as_bytes().try_into().unwrap(),
             reserved: reserved.to_be_bytes(),
             info_hash,
             peer_id,
@@ -54,47 +57,48 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub async fn new(address: SocketAddr, info_hash: [u8; 20]) -> anyhow::Result<Self> {
-        let mut handshake = Handshake::new(info_hash);
-        let mut handshake_bytes = bincode::serialize(&handshake)?;
+    pub async fn new(address: SocketAddr, info_hash: [u8; 20]) -> Result<Self> {
+        let handshake = Handshake::new(info_hash);
+        let handshake_bytes = bincode::serialize(&handshake)?;
 
         let mut peer_stream = TcpStream::connect(address)
             .await
-            .context("failed to connect to peer")?;
+            .context("Failed to connect to peer")?;
         peer_stream
             .write_all(&handshake_bytes)
             .await
-            .context("failed to send handshake")?;
-        peer_stream
-            .read_exact(&mut handshake_bytes)
-            .await
-            .context("failed to receive handshake")?;
+            .context("Failed to send handshake")?;
 
-        handshake = bincode::deserialize(&handshake_bytes)?;
-        let peer = Peer {
+        let mut response_bytes = vec![0u8; mem::size_of::<Handshake>()];
+        peer_stream
+            .read_exact(&mut response_bytes)
+            .await
+            .context("Failed to receive handshake")?;
+        let response_handshake: Handshake = bincode::deserialize(&response_bytes)?;
+
+        Ok(Peer {
             address,
-            id: handshake.peer_id,
+            id: response_handshake.peer_id,
             stream: Arc::new(Mutex::new(peer_stream)),
-            supports_extension: handshake.supports_extension(),
+            supports_extension: response_handshake.supports_extension(),
             metadata_extension_id: None,
-        };
-        Ok(peer)
+        })
     }
 
-    pub async fn extension_handshake(&mut self) -> anyhow::Result<()> {
+    pub async fn extension_handshake(&mut self) -> Result<()> {
         let ext_header = ExtensionHeader::new();
         let mut payload = serde_bencode::to_bytes(&ext_header)?;
         payload.insert(0, 0);
 
-        let handshake = Message::new(MessageId::EXTENSION, payload);
-        self.send(handshake).await?;
+        let handshake_msg = Message::new(MessageId::Extension, payload);
+        self.send(handshake_msg).await?;
         let reply = self.recv().await?;
         let ext_header = serde_bencode::from_bytes::<ExtensionHeader>(&reply.payload[1..])?;
         self.metadata_extension_id = Some(ext_header.m.ut_metadata);
         Ok(())
     }
 
-    pub async fn extension_metadata(&mut self) -> anyhow::Result<Info> {
+    pub async fn extension_metadata(&mut self) -> Result<Info> {
         let ext_msg = ExtensionMessage {
             msg_type: ExtensionMessageType::Request,
             piece: 0,
@@ -103,107 +107,112 @@ impl Peer {
         let mut payload = serde_bencode::to_bytes(&ext_msg)?;
         let extension_msg_id = self
             .metadata_extension_id
-            .expect("metadata extension id should be set during handshake");
+            .ok_or_else(|| anyhow!("Metadata extension ID not set"))?;
         payload.insert(0, extension_msg_id);
 
-        let msg = Message::new(MessageId::EXTENSION, payload);
+        let msg = Message::new(MessageId::Extension, payload);
         self.send(msg).await?;
         let reply = self.recv().await?;
         let ext_msg = serde_bencode::from_bytes::<ExtensionMessage>(&reply.payload[1..])?;
-        let metadata_piece_len = ext_msg.total_size.unwrap();
-        let metadata = &reply.payload[reply.payload.len() - metadata_piece_len as usize..];
+        let metadata_piece_len = ext_msg
+            .total_size
+            .ok_or_else(|| anyhow!("Total size not specified"))?
+            as usize;
+        let metadata = &reply.payload[reply.payload.len() - metadata_piece_len..];
         let torrent_info = serde_bencode::from_bytes::<Info>(metadata)?;
         Ok(torrent_info)
     }
 
-    async fn recv(&mut self) -> anyhow::Result<Message> {
-        let mut stream = self.stream.lock().await;
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf).await?;
-        let length = u32::from_be_bytes(buf);
-
-        let mut buf = [0u8; 1];
-        stream.read_exact(&mut buf).await?;
-        let id: MessageId = unsafe { mem::transmute(buf[0]) };
-
-        let mut buf = vec![0u8; length as usize - mem::size_of::<MessageId>()];
-        stream.read_exact(&mut buf).await?;
-        Ok(Message {
-            length,
-            id,
-            payload: buf,
-        })
-    }
-
-    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+    async fn send(&self, msg: Message) -> Result<()> {
         let mut stream = self.stream.lock().await;
         stream.write_all(&msg.as_bytes()).await?;
         Ok(())
     }
 
-    pub async fn get_pieces(&mut self) -> anyhow::Result<Vec<usize>> {
-        let msg = self.recv().await?;
-        anyhow::ensure!(msg.id == MessageId::BITFIELD);
-        let bitfield = BitVec::<u8, Msb0>::from_vec(msg.payload);
-        let pieces = bitfield.iter_ones().collect();
-        Ok(pieces)
+    async fn recv(&self) -> Result<Message> {
+        let mut stream = self.stream.lock().await;
+        let length = stream.read_u32().await?;
+        let id = MessageId::try_from(stream.read_u8().await?)?;
+        let mut payload = vec![0u8; (length - 1) as usize];
+        stream.read_exact(&mut payload).await?;
+        Ok(Message {
+            length,
+            id,
+            payload,
+        })
     }
 
-    pub async fn prepare_download(&mut self) -> anyhow::Result<()> {
-        let interested = Message::new(MessageId::INTERESTED, vec![]);
+    pub async fn get_pieces(&self) -> Result<Vec<usize>> {
+        let msg = self.recv().await?;
+        if msg.id != MessageId::Bitfield {
+            bail!("Expected BITFIELD message, got {:?}", msg.id);
+        }
+        let bitfield = BitVec::<u8, Msb0>::from_vec(msg.payload);
+        Ok(bitfield.iter_ones().collect())
+    }
+
+    pub async fn prepare_download(&self) -> Result<()> {
+        let interested = Message::new(MessageId::Interested, vec![]);
         self.send(interested).await?;
         let msg = self.recv().await?;
-        anyhow::ensure!(msg.id == MessageId::UNCHOKE);
+        if msg.id != MessageId::Unchoke {
+            bail!("Expected UNCHOKE message, got {:?}", msg.id);
+        }
         Ok(())
     }
 
-    pub async fn load_piece(&mut self, index: u32, piece_len: u32) -> anyhow::Result<Vec<u8>> {
-        let mut piece = vec![0u8; piece_len as usize];
-        let mut join_set = JoinSet::new();
+    pub async fn load_piece(&self, index: u32, piece_len: u32) -> Result<Vec<u8>> {
+        // TODO:
+        // 1. Add maximum retry limits
+        // 2. Implement exponential backoff
+        // 3. Add timeout mechanisms
 
-        let spawn = |join_set: &mut JoinSet<_>, mut peer: Peer, offset: u32| {
+        let mut piece = vec![0u8; piece_len as usize];
+        let mut join_set: JoinSet<(usize, Vec<u8>)> = JoinSet::new();
+
+        for offset in (0..piece_len).step_by(BLOCK_SIZE as usize) {
             let length = BLOCK_SIZE.min(piece_len - offset);
+            let peer = self.clone();
             join_set.spawn(async move {
-                match peer.load_block(index, offset, length).await {
-                    Ok(msg) => (offset, msg.payload[8..].to_vec()),
-                    Err(err) => {
-                        eprintln!("Error loading block: {}. Will retry...", err);
-                        (offset, vec![])
+                loop {
+                    match peer.load_block(index, offset, length).await {
+                        Ok(block) => {
+                            return (offset as usize, block.payload[8..].to_vec());
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "Error loading block at offset {}: {}. Retrying...",
+                                offset, err
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             });
-        };
-
-        for offset in (0..piece_len).step_by(BLOCK_SIZE as usize) {
-            spawn(&mut join_set, self.clone(), offset);
         }
 
         while let Some(join_result) = join_set.join_next().await {
-            let (offset, data) = join_result.context("Task panicked")?;
-            if data.is_empty() {
-                spawn(&mut join_set, self.clone(), offset);
-            } else {
-                let start = offset as usize;
-                let end = start + data.len();
-                piece[start..end].copy_from_slice(&data);
-            }
+            let (offset, data) = join_result?;
+            piece[offset..offset + data.len()].copy_from_slice(&data);
         }
 
         Ok(piece)
     }
 
-    async fn load_block(&mut self, index: u32, begin: u32, length: u32) -> anyhow::Result<Message> {
-        let payload = vec![
-            index.to_be_bytes(),
-            begin.to_be_bytes(),
-            length.to_be_bytes(),
-        ]
-        .concat();
-        let request = Message::new(MessageId::REQUEST, payload);
+    async fn load_block(&self, index: u32, begin: u32, length: u32) -> Result<Message> {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&index.to_be_bytes());
+        payload.extend_from_slice(&begin.to_be_bytes());
+        payload.extend_from_slice(&length.to_be_bytes());
+        let request = Message::new(MessageId::Request, payload);
         self.send(request).await?;
+
         let msg = self.recv().await?;
-        anyhow::ensure!(msg.id == MessageId::PIECE);
-        Ok(msg)
+        if msg.id == MessageId::Piece {
+            Ok(msg)
+        } else {
+            bail!("Expected PIECE message, got {:?}", msg.id);
+        }
     }
 
     pub fn gen_peer_id() -> String {
@@ -221,17 +230,6 @@ struct Message {
     payload: Vec<u8>,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-#[repr(u8)]
-enum MessageId {
-    BITFIELD = 5,
-    INTERESTED = 2,
-    UNCHOKE = 1,
-    REQUEST = 6,
-    PIECE = 7,
-    EXTENSION = 20,
-}
-
 impl Message {
     fn new(id: MessageId, payload: Vec<u8>) -> Self {
         let length = (mem::size_of::<MessageId>() + payload.len()) as u32;
@@ -243,10 +241,49 @@ impl Message {
     }
 
     fn as_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend(self.length.to_be_bytes());
+        let mut bytes = Vec::with_capacity(
+            mem::size_of_val(&self.length) + mem::size_of_val(&self.id) + self.payload.len(),
+        );
+        bytes.extend_from_slice(&self.length.to_be_bytes());
         bytes.push(self.id as u8);
-        bytes.extend(self.payload.as_slice());
+        bytes.extend_from_slice(&self.payload);
         bytes
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+#[repr(u8)]
+enum MessageId {
+    Choke = 0,
+    Unchoke = 1,
+    Interested = 2,
+    NotInterested = 3,
+    Have = 4,
+    Bitfield = 5,
+    Request = 6,
+    Piece = 7,
+    Cancel = 8,
+    Reject = 16,
+    Extension = 20,
+}
+
+impl TryFrom<u8> for MessageId {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Choke),
+            1 => Ok(Self::Unchoke),
+            2 => Ok(Self::Interested),
+            3 => Ok(Self::NotInterested),
+            4 => Ok(Self::Have),
+            5 => Ok(Self::Bitfield),
+            6 => Ok(Self::Request),
+            7 => Ok(Self::Piece),
+            8 => Ok(Self::Cancel),
+            16 => Ok(Self::Reject),
+            20 => Ok(Self::Extension),
+            v => bail!("Invalid message id: {}", v),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::Result;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
 };
 use tokio::{net::UdpSocket, task::JoinSet};
-use url::form_urlencoded;
+use url::Url;
 
 use crate::{
     magnet::Magnet,
@@ -42,13 +42,13 @@ enum Additional {
 
 impl Info {
     pub fn pieces(&self) -> Vec<Vec<u8>> {
-        self.pieces.chunks(20).map(|c| c.to_vec()).collect()
+        self.pieces.chunks(20).map(|chunk| chunk.to_vec()).collect()
     }
 
     pub fn file_len(&self) -> u32 {
         match &self.additional {
             Additional::SingleFile { length } => *length,
-            Additional::MultiFile { files } => files.iter().map(|f| f.length).sum(),
+            Additional::MultiFile { files } => files.iter().map(|file| file.length).sum(),
         }
     }
 }
@@ -60,20 +60,25 @@ struct File {
 }
 
 impl Torrent {
-    pub fn new(file_name: PathBuf) -> anyhow::Result<Self> {
+    pub fn new(file_name: PathBuf) -> Result<Self> {
         let content = std::fs::read(file_name)?;
-        Ok(serde_bencode::from_bytes::<Self>(&content)?)
+        let torrent = serde_bencode::from_bytes::<Self>(&content)?;
+        Ok(torrent)
     }
 
-    pub fn from_magnet_and_metadata(magnet: Magnet, metadata: Info) -> anyhow::Result<Self> {
+    pub fn from_magnet_and_metadata(magnet: Magnet, metadata: Info) -> Result<Self> {
         Ok(Self {
-            announce: magnet.tracker_url.unwrap().to_string(),
+            announce: magnet
+                .tracker_url
+                .map(|url| url.to_string())
+                .unwrap_or_default(),
             info: metadata,
         })
     }
 
-    pub fn info_hash(&self) -> anyhow::Result<[u8; 20]> {
-        Ok(Sha1::digest(serde_bencode::to_bytes(&self.info)?).into())
+    pub fn info_hash(&self) -> Result<[u8; 20]> {
+        let info_bytes = serde_bencode::to_bytes(&self.info)?;
+        Ok(Sha1::digest(&info_bytes).into())
     }
 
     pub fn len(&self) -> u32 {
@@ -84,62 +89,67 @@ impl Torrent {
         self.info.pieces()
     }
 
-    pub async fn get_peer_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
-        let info_hash_str: String = form_urlencoded::byte_serialize(&self.info_hash()?).collect();
+    pub async fn get_peer_addrs(&self) -> Result<Vec<SocketAddr>> {
+        let info_hash = self.info_hash()?;
+        let info_hash_str: String = url::form_urlencoded::byte_serialize(&info_hash).collect();
         let request = TrackerRequest::new(self.len());
-        let announce = &self.announce;
-        if announce.starts_with("http") {
-            let params = serde_urlencoded::to_string(&request)?;
-            let url = format!("{}?{}&info_hash={}", announce, params, info_hash_str);
-            let response = reqwest::get(url).await?;
-            let tracker_response =
-                serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
-            let peer_addrs = tracker_response.peers();
-            println!("Found peers: {:?}", peer_addrs);
-            Ok(peer_addrs)
-        } else if announce.starts_with("udp") {
-            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-            let address = Self::parse_udp_url(announce)?;
-            sock.connect(address).await?;
-            Ok(vec![])
-        } else {
-            Err(anyhow::anyhow!("Unsupported tracker protocol"))
+        let mut announce_url = Url::parse(&self.announce)?;
+
+        match announce_url.scheme() {
+            "http" | "https" => {
+                let params = serde_urlencoded::to_string(&request)?;
+                announce_url.set_query(Some(&format!("{}&info_hash={}", params, info_hash_str)));
+                let response = reqwest::get(announce_url).await?;
+                let tracker_response =
+                    serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)?;
+                let peer_addrs = tracker_response.peers();
+                println!("Found peers: {:?}", peer_addrs);
+                Ok(peer_addrs)
+            }
+            "udp" => {
+                let addr = format!(
+                    "{}:{}",
+                    announce_url.host_str().unwrap_or(""),
+                    announce_url.port_or_known_default().unwrap_or(80)
+                );
+                let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+                sock.connect(addr).await?;
+                todo!()
+            }
+            scheme => anyhow::bail!("Unsupported tracker protocol: {}", scheme),
         }
     }
 
-    fn parse_udp_url(url: &str) -> anyhow::Result<String> {
-        let parts: Vec<&str> = url.split(':').collect();
-        let host = parts[1].trim_start_matches('/');
-        let port = parts[2];
-        let addr = format!("{}:{}", host, port);
-        Ok(addr)
-    }
-
-    pub async fn download_piece(&self, piece: usize) -> anyhow::Result<Vec<u8>> {
+    pub async fn download_piece(&self, piece_index: usize) -> Result<Vec<u8>> {
         let peer_addrs = self.get_peer_addrs().await?;
         let info_hash = self.info_hash()?;
+
         for peer_address in peer_addrs {
             match Peer::new(peer_address, info_hash).await {
-                Ok(mut peer) => {
+                Ok(peer) => {
                     let pieces = peer.get_pieces().await?;
-                    if pieces.contains(&piece) {
-                        let piece = piece as u32;
+                    if pieces.contains(&piece_index) {
                         let piece_len = std::cmp::min(
-                            self.info.piece_length,                      // piece_len
-                            self.len() - piece * self.info.piece_length, // last piece
+                            self.info.piece_length,                                     // piece_len
+                            self.len() - (piece_index as u32 * self.info.piece_length), // last piece
                         );
                         peer.prepare_download().await?;
-                        let piece_data = peer.load_piece(piece, piece_len).await?;
-                        return Ok(piece_data);
+                        return peer.load_piece(piece_index as u32, piece_len).await;
                     }
                 }
                 Err(e) => eprintln!("{} -> {}", peer_address, e),
             }
         }
-        Err(anyhow::anyhow!("Could not find peer"))
+        anyhow::bail!("Could not find peer with the requested piece")
     }
 
-    pub async fn download(&self) -> anyhow::Result<Vec<u8>> {
+    pub async fn download(&self) -> Result<Vec<u8>> {
+        // TODO:
+        // 1. Add maximum retry limits
+        // 2. Implement exponential backoff
+        // 3. Add timeout mechanisms
+        // 4. Consider switching to different peers after X failed attempts
+
         let peer_addrs = self.get_peer_addrs().await?;
         let piece_hashes = self.pieces();
         let num_pieces = piece_hashes.len();
@@ -152,7 +162,7 @@ impl Torrent {
 
         for peer_address in peer_addrs {
             match Peer::new(peer_address, info_hash).await {
-                Ok(mut peer) => {
+                Ok(peer) => {
                     let pieces = peer.get_pieces().await?;
                     for piece in pieces {
                         peer_piece_map
@@ -167,63 +177,49 @@ impl Torrent {
         }
 
         if peer_piece_map.is_empty() {
-            return Err(anyhow::anyhow!("Could not connect to any peers"));
+            anyhow::bail!("Could not connect to any peers");
         }
 
-        let choose_peer = |piece: usize| {
-            let peers = peer_piece_map.get(&piece).unwrap();
-            peers.choose(&mut rand::thread_rng()).unwrap().clone()
-        };
+        for piece in 0..num_pieces {
+            if let Some(peers) = peer_piece_map.get(&piece) {
+                let peer = peers.choose(&mut rand::thread_rng()).unwrap().clone();
+                let piece_len = std::cmp::min(piece_len, file_len - (piece as u32 * piece_len));
+                let piece_hash = piece_hashes[piece].clone();
 
-        let spawn = |join_set: &mut JoinSet<_>, piece: usize| {
-            let mut peer = choose_peer(piece);
-            let piece_hashes = piece_hashes.clone();
-            let piece_number = piece + 1;
-            let piece_len = std::cmp::min(piece_len, file_len - piece as u32 * piece_len);
-
-            join_set.spawn(async move {
-                match peer.load_piece(piece as u32, piece_len).await {
-                    Ok(data) => {
-                        println!(
-                            "Downloaded piece {}/{} from peer {}",
-                            piece_number, num_pieces, peer.address
-                        );
-                        if piece_hashes[piece] != *Sha1::digest(&data) {
-                            eprintln!(
-                                "Piece {}/{} failed verification. Will retry...",
-                                piece_number, num_pieces
-                            );
-                            (piece, vec![])
-                        } else {
-                            (piece, data)
+                join_set.spawn(async move {
+                    loop {
+                        match peer.load_piece(piece as u32, piece_len).await {
+                            Ok(piece_data) => {
+                                let hash = Sha1::digest(&piece_data);
+                                if hash.as_slice() == piece_hash.as_slice() {
+                                    return (piece, piece_data);
+                                } else {
+                                    eprintln!(
+                                        "Piece {} failed verification. Retrying...",
+                                        piece + 1
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "Error loading piece {}: {}. Retrying...",
+                                    piece + 1,
+                                    err
+                                );
+                            }
                         }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "Error loading piece {}/{}: {}. Will retry...",
-                            piece_number, num_pieces, e
-                        );
-                        (piece, vec![])
-                    }
-                }
-            });
-        };
-
-        for piece in 0..num_pieces {
-            spawn(&mut join_set, piece);
+                });
+            }
         }
 
         let mut file_bytes = vec![0u8; file_len as usize];
+
         while let Some(join_result) = join_set.join_next().await {
-            let (piece, data) = join_result.context("Task panicked")?;
-            if data.is_empty() {
-                println!("Retrying piece {}/{}", piece + 1, num_pieces);
-                spawn(&mut join_set, piece);
-            } else {
-                let start = piece * piece_len as usize;
-                let end = start + data.len();
-                file_bytes[start..end].copy_from_slice(&data);
-            }
+            let (piece, data) = join_result?;
+            let start = piece * piece_len as usize;
+            let end = start + data.len();
+            file_bytes[start..end].copy_from_slice(&data);
         }
 
         Ok(file_bytes)
