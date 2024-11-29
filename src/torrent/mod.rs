@@ -1,21 +1,23 @@
-use anyhow::Result;
-use rand::seq::SliceRandom;
-use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
+
+use anyhow::Result;
+use rand::seq::SliceRandom;
+use serde::Deserialize;
+use sha1::{Digest, Sha1};
 use tokio::{net::UdpSocket, task::JoinSet, time::sleep};
 use url::Url;
 
-use crate::{
-    magnet::Magnet,
-    peer::Peer,
-    tracker::{TrackerRequest, TrackerResponse},
-};
+mod info;
+pub use info::Info;
+mod tracker;
+use tracker::{TrackerRequest, TrackerResponse};
+
+use crate::{magnet::Magnet, peer::Peer};
 
 #[derive(Clone, Deserialize)]
 pub struct Torrent {
@@ -36,7 +38,7 @@ impl Torrent {
             announce: magnet
                 .tracker_url
                 .as_ref()
-                .map(|url| url.to_string())
+                .map(Url::to_string)
                 .unwrap_or_default(),
             info: None,
             info_hash: Some(magnet.info_hash),
@@ -44,20 +46,19 @@ impl Torrent {
     }
 
     pub fn get_info(&self) -> Result<&Info> {
-        if let Some(info) = &self.info {
-            Ok(info)
-        } else {
-            anyhow::bail!("No info section found in torrent file")
-        }
+        self.info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No info section found in torrent file"))
     }
 
     pub fn get_info_hash(&mut self) -> Result<[u8; 20]> {
-        if let Some(info_hash) = &self.info_hash {
-            Ok(*info_hash)
+        if let Some(info_hash) = self.info_hash {
+            Ok(info_hash)
         } else {
             let info_bytes = serde_bencode::to_bytes(&self.get_info()?)?;
-            self.info_hash = Some(Sha1::digest(&info_bytes).into());
-            Ok(self.info_hash.unwrap())
+            let hash = Sha1::digest(&info_bytes).into();
+            self.info_hash = Some(hash);
+            Ok(hash)
         }
     }
 
@@ -100,16 +101,17 @@ impl Torrent {
             match Peer::new(peer_address, info_hash).await {
                 Ok(mut peer) => {
                     let pieces = peer.get_pieces().await?;
-                    if peer.supports_extension && self.info.is_none() {
+                    if peer.supports_extension {
                         peer.extension_handshake().await?;
-                        self.info = Some(peer.extension_metadata().await?);
+                        if self.info.is_none() {
+                            self.info = Some(peer.extension_metadata().await?);
+                        }
                     }
                     if pieces.contains(&piece_index) {
                         let info = self.get_info()?;
-                        let piece_len = info.piece_length;
                         let piece_len = std::cmp::min(
-                            piece_len,
-                            info.file_len() - (piece_index as u32 * piece_len),
+                            info.piece_length,
+                            info.file_len() - (piece_index as u32 * info.piece_length),
                         );
                         peer.prepare_download().await?;
                         return peer.load_piece(piece_index as u32, piece_len).await;
@@ -163,13 +165,15 @@ impl Torrent {
         let piece_hashes = info.pieces();
         let num_pieces = piece_hashes.len();
         let file_len = info.file_len();
-        let piece_len = info.piece_length;
         let mut join_set = JoinSet::new();
 
         for piece in 0..num_pieces {
             if let Some(peers) = peer_piece_map.get(&piece) {
                 let peer = peers.choose(&mut rand::thread_rng()).unwrap().clone();
-                let piece_len = std::cmp::min(piece_len, file_len - (piece as u32 * piece_len));
+                let piece_len = std::cmp::min(
+                    info.piece_length,
+                    file_len - (piece as u32 * info.piece_length),
+                );
                 let piece_hash = piece_hashes[piece].clone();
                 let piece_number = piece + 1;
 
@@ -207,48 +211,11 @@ impl Torrent {
 
         while let Some(join_result) = join_set.join_next().await {
             let (piece, data) = join_result?;
-            let start = piece * piece_len as usize;
+            let start = piece * info.piece_length as usize;
             let end = start + data.len();
             file_bytes[start..end].copy_from_slice(&data);
         }
 
         Ok(file_bytes)
     }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Info {
-    #[serde(rename = "piece length")]
-    pub piece_length: u32,
-    #[serde(with = "serde_bytes")]
-    pub pieces: Vec<u8>,
-    name: String,
-    #[serde(flatten)]
-    additional: Additional,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum Additional {
-    SingleFile { length: u32 },
-    MultiFile { files: Vec<File> },
-}
-
-impl Info {
-    pub fn pieces(&self) -> Vec<Vec<u8>> {
-        self.pieces.chunks(20).map(|chunk| chunk.to_vec()).collect()
-    }
-
-    pub fn file_len(&self) -> u32 {
-        match &self.additional {
-            Additional::SingleFile { length } => *length,
-            Additional::MultiFile { files } => files.iter().map(|file| file.length).sum(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct File {
-    length: u32,
-    path: Vec<String>,
 }

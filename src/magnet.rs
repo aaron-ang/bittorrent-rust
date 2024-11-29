@@ -1,5 +1,6 @@
-use anyhow::Result;
 use std::{collections::HashMap, net::SocketAddr};
+
+use anyhow::Result;
 use url::Url;
 
 use crate::{peer::Peer, torrent::Torrent};
@@ -18,8 +19,11 @@ impl Magnet {
             anyhow::bail!("invalid magnet link");
         }
 
-        let query_pairs = url.query_pairs().collect::<HashMap<_, _>>();
-        let xt = query_pairs.get("xt").ok_or(anyhow::anyhow!("missing xt"))?;
+        let query_pairs: HashMap<_, _> = url.query_pairs().collect();
+        let xt = query_pairs
+            .get("xt")
+            .ok_or_else(|| anyhow::anyhow!("missing xt"))?;
+
         if !xt.starts_with(MAGNET_XT_PREFIX) {
             anyhow::bail!("invalid xt");
         }
@@ -30,12 +34,11 @@ impl Magnet {
         let file_name = query_pairs.get("dn").map(|s| s.to_string());
         let tracker_url = query_pairs.get("tr").map(|s| Url::parse(s)).transpose()?;
 
-        let magnet = Self {
+        Ok(Self {
             info_hash,
             file_name,
             tracker_url,
-        };
-        Ok(magnet)
+        })
     }
 
     pub async fn handshake(&self) -> Result<Peer> {

@@ -1,7 +1,7 @@
-#![allow(dead_code)]
+use std::mem;
+
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use std::mem;
 
 #[derive(Serialize, Deserialize)]
 pub struct ExtensionHeader {
