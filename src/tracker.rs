@@ -14,14 +14,14 @@ pub struct TrackerRequest {
 }
 
 impl TrackerRequest {
-    pub fn new(left: u32) -> Self {
+    pub fn new() -> Self {
         let peer_id = Peer::gen_peer_id();
         Self {
             peer_id,
             port: 6881,
             uploaded: 0,
             downloaded: 0,
-            left,
+            left: 1,
             compact: 1,
         }
     }
