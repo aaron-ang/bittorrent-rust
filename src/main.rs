@@ -1,5 +1,6 @@
-use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf};
+
+use clap::{Parser, Subcommand};
 use tokio::{fs::File, io::AsyncWriteExt};
 use url::Url;
 

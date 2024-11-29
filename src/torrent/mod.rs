@@ -13,8 +13,9 @@ use tokio::{net::UdpSocket, task::JoinSet, time::sleep};
 use url::Url;
 
 mod info;
-pub use info::Info;
 mod tracker;
+
+pub use info::Info;
 use tracker::{TrackerRequest, TrackerResponse};
 
 use crate::{magnet::Magnet, peer::Peer};
