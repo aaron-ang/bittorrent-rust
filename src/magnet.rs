@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{peer::Peer, torrent::Torrent};
 
-const MAGNET_XT_PREFIX: &'static str = "urn:btih:";
+const MAGNET_XT_PREFIX: &str = "urn:btih:";
 
 pub struct Magnet {
     pub info_hash: [u8; 20], // raw bytes

@@ -125,13 +125,12 @@ impl Torrent {
     }
 
     pub async fn download(&mut self) -> Result<Vec<u8>> {
-        // TODO:
-        // 1. Add maximum retry limits
-        // 2. Implement exponential backoff
-        // 3. Add timeout mechanisms
-        // 4. Consider switching to different peers after X failed attempts
-        // 5. Break function into smaller functions
+        let (peer_piece_map, info) = self.connect_and_map_peers().await?;
+        let pieces = Self::download_pieces(peer_piece_map, &info).await?;
+        Ok(Self::assemble_file(pieces, &info))
+    }
 
+    async fn connect_and_map_peers(&mut self) -> Result<(HashMap<usize, Vec<Peer>>, Info)> {
         let peer_addrs = self.fetch_peer_addresses().await?;
         let info_hash = self.get_info_hash()?;
         let mut peer_piece_map: HashMap<usize, Vec<Peer>> = HashMap::new();
@@ -147,10 +146,7 @@ impl Torrent {
                         }
                     }
                     for piece in pieces {
-                        peer_piece_map
-                            .entry(piece)
-                            .or_insert_with(Vec::new)
-                            .push(peer.clone());
+                        peer_piece_map.entry(piece).or_default().push(peer.clone());
                     }
                     peer.prepare_download().await?;
                 }
@@ -162,61 +158,67 @@ impl Torrent {
             anyhow::bail!("Could not find any peers with the requested pieces")
         }
 
-        let info = self.get_info()?;
+        Ok((peer_piece_map, self.get_info()?.clone()))
+    }
+
+    async fn download_pieces(
+        peer_piece_map: HashMap<usize, Vec<Peer>>,
+        info: &Info,
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
         let piece_hashes = info.pieces();
         let num_pieces = piece_hashes.len();
         let file_len = info.file_len();
         let mut join_set = JoinSet::new();
 
-        for piece in 0..num_pieces {
-            if let Some(peers) = peer_piece_map.get(&piece) {
-                let peer = peers.choose(&mut rand::thread_rng()).unwrap().clone();
-                let piece_len = std::cmp::min(
-                    info.piece_length,
-                    file_len - (piece as u32 * info.piece_length),
-                );
-                let piece_hash = piece_hashes[piece].clone();
-                let piece_number = piece + 1;
+        for (piece, peers) in peer_piece_map {
+            let peer = peers.choose(&mut rand::thread_rng()).unwrap().clone();
+            let piece_len = std::cmp::min(
+                info.piece_length,
+                file_len - (piece as u32 * info.piece_length),
+            );
+            let piece_hash = piece_hashes[piece].clone();
+            let piece_number = piece + 1;
 
-                join_set.spawn(async move {
-                    loop {
-                        match peer.load_piece(piece as u32, piece_len).await {
-                            Ok(piece_data) => {
-                                if Sha1::digest(&piece_data).as_slice() == piece_hash.as_slice() {
-                                    println!(
-                                        "Successfully downloaded piece {}/{} from peer {}",
-                                        piece_number, num_pieces, peer.address
-                                    );
-                                    return (piece, piece_data);
-                                } else {
-                                    eprintln!(
-                                        "Piece {} failed verification. Retrying...",
-                                        piece_number
-                                    );
-                                }
-                            }
-                            Err(err) => {
+            join_set.spawn(async move {
+                loop {
+                    match peer.load_piece(piece as u32, piece_len).await {
+                        Ok(piece_data) => {
+                            if Sha1::digest(&piece_data).as_slice() == piece_hash.as_slice() {
+                                println!(
+                                    "Successfully downloaded piece {}/{} from peer {}",
+                                    piece_number, num_pieces, peer.address
+                                );
+                                return (piece, piece_data);
+                            } else {
                                 eprintln!(
-                                    "Error loading piece {}: {}. Retrying...",
-                                    piece_number, err
+                                    "Piece {} failed verification. Retrying...",
+                                    piece_number
                                 );
                             }
                         }
-                        sleep(Duration::from_secs(1)).await;
+                        Err(err) => {
+                            eprintln!("Error loading piece {}: {}. Retrying...", piece_number, err);
+                        }
                     }
-                });
-            }
+                    sleep(Duration::from_secs(1)).await;
+                }
+            });
         }
 
-        let mut file_bytes = vec![0u8; file_len as usize];
-
+        let mut pieces = Vec::new();
         while let Some(join_result) = join_set.join_next().await {
-            let (piece, data) = join_result?;
+            pieces.push(join_result?);
+        }
+        Ok(pieces)
+    }
+
+    fn assemble_file(pieces: Vec<(usize, Vec<u8>)>, info: &Info) -> Vec<u8> {
+        let mut file_bytes = vec![0u8; info.file_len() as usize];
+        for (piece, data) in pieces {
             let start = piece * info.piece_length as usize;
             let end = start + data.len();
             file_bytes[start..end].copy_from_slice(&data);
         }
-
-        Ok(file_bytes)
+        file_bytes
     }
 }

@@ -15,7 +15,7 @@ fn bencode_to_json(value: serde_bencode::value::Value) -> anyhow::Result<serde_j
         serde_bencode::value::Value::List(l) => {
             let json_list = l
                 .into_iter()
-                .map(|v| bencode_to_json(v))
+                .map(bencode_to_json)
                 .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
             Ok(serde_json::Value::Array(json_list))
         }

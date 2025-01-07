@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let mut torrent = Torrent::new(torrent)?;
             let peer = Peer::new(peer_address, torrent.get_info_hash()?).await?;
-            println!("Peer ID: {}", hex::encode(&peer.id));
+            println!("Peer ID: {}", hex::encode(peer.id));
         }
         Command::DownloadPiece {
             output,

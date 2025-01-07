@@ -134,11 +134,6 @@ impl Peer {
     }
 
     pub async fn load_piece(&self, index: u32, piece_len: u32) -> Result<Vec<u8>> {
-        // TODO:
-        // 1. Add maximum retry limits
-        // 2. Implement exponential backoff
-        // 3. Add timeout mechanisms
-
         let mut piece = vec![0u8; piece_len as usize];
         let mut join_set: JoinSet<(usize, Vec<u8>)> = JoinSet::new();
 
