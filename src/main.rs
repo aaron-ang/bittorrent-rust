@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use tokio::{fs::File, io::AsyncWriteExt};
 use url::Url;
 
-use bittorrent_starter_rust::*;
+use bittorrent_rs::*;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
